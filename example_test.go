@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"gitlab.wildberries.ru/infrastructure/infrastructure-storage/userstorage/internal/service/replicator/wal"
+	"wal"
 )
 
 func Example() {
@@ -13,19 +13,18 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	l, err := wal.Open(dir, wal.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer l.Close()
 
 	if _, err := l.Append([]byte("set a"), []byte("set b"), []byte("del a")); err != nil {
 		log.Fatal(err)
 	}
 
-	// A consumer resumes at the checkpoint and commits what it has handled.
+	// A consumer resumes at the checkpoint and commits past what it handled.
 	recs, err := l.Read(l.Committed(), 2)
 	if err != nil {
 		log.Fatal(err)
@@ -39,9 +38,13 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	fmt.Println("committed:", l.Committed(), "last:", l.LastIndex())
+	fmt.Println("resume at", l.Committed())
+
+	if err := l.Close(); err != nil {
+		log.Fatal(err)
+	}
 	// Output:
 	// 1 set a
 	// 2 set b
-	// committed: 3 last: 3
+	// resume at 3
 }

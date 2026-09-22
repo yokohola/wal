@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -9,64 +10,68 @@ import (
 	"strings"
 )
 
-// load rebuilds the in-memory state from the directory.
+// sectorSize is the unit a disk writes atomically. A write cut short by a crash
+// leaves whole sectors unwritten, and those read back as zeros.
+const sectorSize = 512
+
+var zeroSector [sectorSize]byte
+
+// load rebuilds the log from its directory. It deletes temp files and committed
+// segments a crash left behind and cuts a torn tail off the active segment. Any
+// other inconsistency is ErrCorrupt.
 func (l *Log) load() error {
-	segments, err := loadSegments(l.dir)
+	firsts, err := listSegments(l.dir)
 	if err != nil {
 		return err
 	}
 
-	if len(segments) == 0 {
+	checkpoint, found, err := readCheckpoint(l.dir)
+	if err != nil {
+		return err
+	}
+
+	var segments []*segment
+
+	switch {
+	case len(firsts) == 0 && found:
+		return fmt.Errorf("%w: checkpoint %d but no segments", ErrCorrupt, checkpoint)
+	case len(firsts) == 0:
 		seg, err := createSegment(l.dir, 1, l.opts.SegmentSize)
 		if err != nil {
 			return err
 		}
 
-		segments = append(segments, seg)
+		segments, checkpoint = []*segment{seg}, 1
+	default:
+		if !found && firsts[0] != 1 {
+			return fmt.Errorf("%w: no checkpoint but the first segment starts at %d", ErrCorrupt, firsts[0])
+		}
+
+		if !found {
+			checkpoint = 1
+		}
+
+		segments, err = loadSegments(l.dir, firsts, checkpoint, l.opts.SegmentSize)
+		if err != nil {
+			return err
+		}
 	}
 
+	// Recovery synced the active segment, so every record found is durable.
 	l.segments = segments
+	l.committed = checkpoint
+	l.synced = l.active().nextIndex()
+
 	for _, seg := range segments {
 		l.size += seg.size
 	}
 
-	if err := l.applyCheckpoint(); err != nil {
-		return err
-	}
-
-	if err := l.openActive(); err != nil {
-		return err
-	}
-
-	return l.reclaim()
+	return nil
 }
 
-// loadSegments validates every segment file and their continuity. Stale temp
-// files from an interrupted segment creation or checkpoint are removed.
-func loadSegments(dir string) ([]*segment, error) {
-	firsts, err := listSegments(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	segments := make([]*segment, 0, len(firsts))
-
-	for pos, first := range firsts {
-		seg, err := loadSegment(dir, first, pos == len(firsts)-1)
-		if err != nil {
-			return nil, err
-		}
-
-		if pos > 0 && segments[pos-1].next() != first {
-			return nil, fmt.Errorf("%w: %s does not continue %s", ErrCorrupt, seg.path, segments[pos-1].path)
-		}
-
-		segments = append(segments, seg)
-	}
-
-	return segments, nil
-}
-
+// listSegments returns the first indexes of the segments in dir, ascending. It
+// deletes the temp files a crash leaves while a segment or the checkpoint is
+// written and leaves every other file alone.
 func listSegments(dir string) ([]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -78,15 +83,15 @@ func listSegments(dir string) ([]uint64, error) {
 	for _, entry := range entries {
 		name := entry.Name()
 
-		if strings.HasSuffix(name, tmpExt) {
-			if err := os.Remove(filepath.Join(dir, name)); err != nil {
-				return nil, wrap(err)
+		if isTempName(name) {
+			if err := removeFile(filepath.Join(dir, name)); err != nil {
+				return nil, err
 			}
 
 			continue
 		}
 
-		if first, ok := parseSegmentFileName(name); ok {
+		if first, ok := parseSegmentName(name); ok {
 			firsts = append(firsts, first)
 		}
 	}
@@ -96,67 +101,210 @@ func listSegments(dir string) ([]uint64, error) {
 	return firsts, nil
 }
 
-// applyCheckpoint restores the committed index. A checkpoint past the last
-// record means committed records were lost with an unsynced tail; the log
-// continues after the checkpoint so no index is ever reused.
-func (l *Log) applyCheckpoint() error {
-	index, found, err := readCheckpoint(l.dir)
+// loadSegments validates the segments named by firsts against the checkpoint
+// and opens the last one for appending. Segments wholly below the checkpoint
+// are skipped and deleted once the rest is valid: a crash after the checkpoint
+// is written can leave any of them, so gaps there are no damage.
+func loadSegments(dir string, firsts []uint64, checkpoint uint64, prealloc int64) ([]*segment, error) {
+	live := firsts
+	for len(live) > 1 && live[1] <= checkpoint {
+		live = live[1:]
+	}
+
+	if checkpoint < live[0] {
+		return nil, fmt.Errorf("%w: checkpoint %d is below the first segment %d", ErrCorrupt, checkpoint, live[0])
+	}
+
+	segments, err := openSegments(dir, live, prealloc)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	l.committed = l.segments[0].first
-	if found {
-		l.committed = max(index, l.committed)
+	active := segments[len(segments)-1]
+	if checkpoint > active.nextIndex() {
+		return nil, errors.Join(
+			fmt.Errorf("%w: checkpoint %d is past the last record %d", ErrCorrupt, checkpoint, active.nextIndex()-1),
+			active.close())
 	}
 
-	if l.committed <= l.active().next() {
-		return nil
+	for _, first := range firsts[:len(firsts)-len(live)] {
+		if err := removeFile(filepath.Join(dir, segmentName(first))); err != nil {
+			return nil, errors.Join(err, active.close())
+		}
 	}
 
-	seg, err := createSegment(l.dir, l.committed, l.opts.SegmentSize)
-	if err != nil {
-		return err
-	}
-
-	l.segments = append(l.segments, seg)
-	l.size += segmentHeaderSize
-
-	return nil
+	return segments, nil
 }
 
-func (l *Log) openActive() error {
-	tail := l.active()
-	if tail.file != nil {
-		return nil
+// openSegments validates contiguous segments and opens the last for appending.
+func openSegments(dir string, firsts []uint64, prealloc int64) ([]*segment, error) {
+	last := len(firsts) - 1
+	segments := make([]*segment, 0, len(firsts))
+
+	for i, first := range firsts[:last] {
+		seg, err := loadClosedSegment(dir, first)
+		if err != nil {
+			return nil, err
+		}
+
+		if seg.nextIndex() != firsts[i+1] {
+			return nil, fmt.Errorf("%w: %s ends at index %d but the next segment starts at %d",
+				ErrCorrupt, seg.path, seg.nextIndex()-1, firsts[i+1])
+		}
+
+		segments = append(segments, seg)
 	}
 
-	file, err := os.OpenFile(tail.path, os.O_RDWR, 0)
+	active, err := recoverActiveSegment(dir, firsts[last], prealloc)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(segments, active), nil
+}
+
+// loadClosedSegment reads a segment that was sealed before the next one was
+// created, so every byte up to its end must be an intact record.
+func loadClosedSegment(dir string, first uint64) (*segment, error) {
+	seg := newSegment(dir, first)
+
+	file, err := os.Open(seg.path)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	defer func() { _ = file.Close() }() // read only, nothing to lose
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, wrap(err)
+	}
+
+	if err := seg.checkHeader(file); err != nil {
+		return nil, err
+	}
+
+	if err := seg.scan(file, info.Size()); err != nil {
+		return nil, seg.recordError(seg.size, err)
+	}
+
+	return seg, nil
+}
+
+// recoverActiveSegment opens the last segment for appending. A torn tail is
+// truncated and the file synced before any append, so new records never land
+// in front of stale bytes that a later crash could expose.
+func recoverActiveSegment(dir string, first uint64, prealloc int64) (*segment, error) {
+	seg := newSegment(dir, first)
+
+	file, err := os.OpenFile(seg.path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, wrap(err)
+	}
+
+	if err := repairActiveSegment(seg, file, prealloc); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+
+	seg.file = file
+
+	return seg, nil
+}
+
+func repairActiveSegment(seg *segment, file *os.File, prealloc int64) error {
+	info, err := file.Stat()
 	if err != nil {
 		return wrap(err)
 	}
 
-	if err := preallocate(file, l.opts.SegmentSize); err != nil {
-		return errors.Join(wrap(err), file.Close())
+	if err := seg.checkHeader(file); err != nil {
+		return err
 	}
 
-	tail.file = file
+	if scanErr := seg.scan(file, info.Size()); scanErr != nil {
+		torn, err := isTornRecord(file, seg.size, scanErr)
+		if err != nil {
+			return err
+		}
+
+		if !torn {
+			return seg.recordError(seg.size, scanErr)
+		}
+	}
+
+	if seg.size < info.Size() {
+		if err := file.Truncate(seg.size); err != nil {
+			return wrap(err)
+		}
+	}
+
+	if err := file.Sync(); err != nil {
+		return wrap(err)
+	}
+
+	if err := preallocate(file, prealloc); err != nil {
+		return wrap(err)
+	}
 
 	return nil
 }
 
-// reclaim removes closed segments whose records are all committed.
-func (l *Log) reclaim() error {
-	for len(l.segments) > 1 && l.segments[0].next() <= l.committed {
-		seg := l.segments[0]
-
-		if err := os.Remove(seg.path); err != nil {
-			return wrap(err)
-		}
-
-		l.size -= seg.size
-		l.segments = slices.Delete(l.segments, 0, 1)
+// isTornRecord reports whether the record at offset, which failed to decode
+// with decodeErr, is a write cut short by a crash rather than damaged data. A
+// cut write runs past the end of the file or has a sector that reads as zeros.
+func isTornRecord(file *os.File, offset int64, decodeErr error) (bool, error) {
+	if errors.Is(decodeErr, errShortRecord) {
+		return true, nil
 	}
 
-	return nil
+	if !errors.Is(decodeErr, errBadHeader) && !errors.Is(decodeErr, errBadData) {
+		return false, decodeErr
+	}
+
+	record := make([]byte, recordHeaderSize)
+	if _, err := file.ReadAt(record, offset); err != nil {
+		return false, wrap(err)
+	}
+
+	if errors.Is(decodeErr, errBadData) {
+		length, err := decodeHeader(record)
+		if err != nil {
+			return false, err
+		}
+
+		record = make([]byte, recordHeaderSize+length)
+		if _, err := file.ReadAt(record, offset); err != nil {
+			return false, wrap(err)
+		}
+	}
+
+	return hasZeroSector(record, offset), nil
+}
+
+// hasZeroSector reports whether the part of buf inside some disk sector is all
+// zeros. buf starts at file offset offset.
+func hasZeroSector(buf []byte, offset int64) bool {
+	for len(buf) > 0 {
+		n := min(int64(len(buf)), sectorSize-offset%sectorSize)
+		if bytes.Equal(buf[:n], zeroSector[:n]) {
+			return true
+		}
+
+		buf = buf[n:]
+		offset += n
+	}
+
+	return false
+}
+
+// isTempName reports whether name is a segment or checkpoint temp file that
+// this package writes before a rename.
+func isTempName(name string) bool {
+	base, ok := strings.CutSuffix(name, tempExt)
+	if !ok {
+		return false
+	}
+
+	_, isSegment := parseSegmentName(base)
+
+	return isSegment || base == checkpointName
 }

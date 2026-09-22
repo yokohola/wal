@@ -4,23 +4,26 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 )
 
 // The checkpoint file holds the committed index and a CRC32C of it. It is
-// replaced atomically, so it is either intact or absent.
+// replaced through a temp file and a rename, so it is the old or the new one.
 const (
-	checkpointFile = "checkpoint"
+	checkpointName = "checkpoint"
 	checkpointSize = 12
-	tmpExt         = ".tmp"
 )
 
+// readCheckpoint returns the committed index, or false when no checkpoint was
+// ever written.
 func readCheckpoint(dir string) (uint64, bool, error) {
-	path := filepath.Join(dir, checkpointFile)
+	path := filepath.Join(dir, checkpointName)
 
-	buf, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, false, nil
 	}
@@ -28,12 +31,18 @@ func readCheckpoint(dir string) (uint64, bool, error) {
 	if err != nil {
 		return 0, false, wrap(err)
 	}
+	defer func() { _ = file.Close() }() // read only, nothing to lose
 
-	if len(buf) != checkpointSize {
-		return 0, false, fmt.Errorf("%w: %s has %d bytes", ErrCorrupt, path, len(buf))
+	buf, err := io.ReadAll(io.LimitReader(file, checkpointSize+1))
+	if err != nil {
+		return 0, false, wrap(err)
 	}
 
-	if checksum(buf[:8], nil) != binary.LittleEndian.Uint32(buf[8:]) {
+	if len(buf) != checkpointSize {
+		return 0, false, fmt.Errorf("%w: %s is not %d bytes", ErrCorrupt, path, checkpointSize)
+	}
+
+	if crc32.Checksum(buf[:8], crcTable) != binary.LittleEndian.Uint32(buf[8:]) {
 		return 0, false, fmt.Errorf("%w: %s checksum mismatch", ErrCorrupt, path)
 	}
 
@@ -44,61 +53,7 @@ func writeCheckpoint(dir string, index uint64) error {
 	var buf [checkpointSize]byte
 
 	binary.LittleEndian.PutUint64(buf[:8], index)
-	binary.LittleEndian.PutUint32(buf[8:], checksum(buf[:8], nil))
+	binary.LittleEndian.PutUint32(buf[8:], crc32.Checksum(buf[:8], crcTable))
 
-	return writeFileAtomic(filepath.Join(dir, checkpointFile), buf[:])
-}
-
-// writeFileAtomic replaces path with data through a synced temp file and
-// rename, then syncs the directory so the rename is durable too.
-func writeFileAtomic(path string, data []byte) error {
-	tmp := path + tmpExt
-
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return wrap(err)
-	}
-
-	if err := writeAndSync(file, data); err != nil {
-		return errors.Join(err, file.Close(), os.Remove(tmp))
-	}
-
-	if err := file.Close(); err != nil {
-		return wrap(err)
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		return wrap(err)
-	}
-
-	return syncDir(filepath.Dir(path))
-}
-
-func writeAndSync(file *os.File, data []byte) error {
-	if _, err := file.Write(data); err != nil {
-		return wrap(err)
-	}
-
-	if err := file.Sync(); err != nil {
-		return wrap(err)
-	}
-
-	return nil
-}
-
-func syncDir(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return wrap(err)
-	}
-
-	if err := handle.Sync(); err != nil {
-		return errors.Join(wrap(err), handle.Close())
-	}
-
-	if err := handle.Close(); err != nil {
-		return wrap(err)
-	}
-
-	return nil
+	return writeFileAtomic(filepath.Join(dir, checkpointName), buf[:])
 }

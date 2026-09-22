@@ -8,29 +8,23 @@ import (
 	"syscall"
 )
 
-// fdatasync skips the inode update fsync would journal on every append.
+// fdatasync flushes data and the metadata needed to read it back, skipping
+// timestamps. Preallocation keeps the file size fixed, so appends usually
+// need no metadata flush at all.
 func fdatasync(file *os.File) error {
-	fd, err := descriptor(file)
-	if err != nil {
-		return err
-	}
-
-	if err := syscall.Fdatasync(fd); err != nil {
+	if err := control(file, syscall.Fdatasync); err != nil {
 		return &os.PathError{Op: "fdatasync", Path: file.Name(), Err: err}
 	}
 
 	return nil
 }
 
-// preallocate reserves size bytes so appends do not allocate extents one by
-// one. Filesystems without fallocate are left alone.
+// preallocate reserves size bytes so appends do not allocate blocks one by one.
+// Filesystems without fallocate are left alone.
 func preallocate(file *os.File, size int64) error {
-	fd, err := descriptor(file)
-	if err != nil {
-		return err
-	}
-
-	err = syscall.Fallocate(fd, 0, 0, size)
+	err := control(file, func(fd int) error {
+		return syscall.Fallocate(fd, 0, 0, size)
+	})
 	if err == nil || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS) {
 		return nil
 	}

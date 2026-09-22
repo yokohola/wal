@@ -3,60 +3,146 @@ package wal
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"hash/crc32"
+	"io"
 	"math"
 )
 
-// A record on disk is a little-endian length, a CRC32C over that length and
-// the data, then the data. Covering the length means a zero-filled tail never
-// parses as a record, so preallocated space is harmless.
-const recordHeaderSize = 8
+// A record is a 12-byte header and its data. The header holds the data length,
+// a CRC32C of the data and a CRC32C of those first 8 bytes, so a damaged length
+// is caught before it is trusted. Zero bytes never form a valid header.
+const (
+	recordHeaderSize = 12
+	maxRecordSize    = math.MaxUint32
 
-var (
-	errTooLarge = errors.New("wal: record too large")
-	errTorn     = errors.New("torn record")
+	// readChunkSize is how many bytes a recordReader fetches at a time.
+	readChunkSize = 256 << 10
 )
 
-func checksum(header, data []byte) uint32 {
-	table := crc32.MakeTable(crc32.Castagnoli)
-	crc := crc32.Update(0, table, header)
+// Decode failures. errShortRecord means the input ends inside the record.
+var (
+	errShortRecord = errors.New("record runs past the end of the data")
+	errBadHeader   = errors.New("record header checksum mismatch")
+	errBadData     = errors.New("record data checksum mismatch")
+)
 
-	return crc32.Update(crc, table, data)
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// recordReader decodes consecutive records from src between offset and end.
+// Every fetch allocates a new chunk, so returned data stays valid.
+type recordReader struct {
+	src    io.ReaderAt
+	offset int64 // file offset of chunk[0]
+	end    int64
+	chunk  []byte
 }
 
-// appendRecord frames data and appends it to dst. Data must fit a 32-bit
-// length.
-func appendRecord(dst, data []byte) ([]byte, error) {
-	size := len(data)
-	if uint64(size) > math.MaxUint32 {
-		return nil, fmt.Errorf("%w: %d bytes", errTooLarge, size)
+// next returns the data of the next record or io.EOF at end. On a decode error
+// offset stays at the failing record.
+func (r *recordReader) next() ([]byte, error) {
+	if r.offset >= r.end {
+		return nil, io.EOF
 	}
 
+	if err := r.fill(recordHeaderSize); err != nil {
+		return nil, err
+	}
+
+	length, err := decodeHeader(r.chunk)
+	if err != nil {
+		return nil, err
+	}
+
+	size := recordHeaderSize + length
+	if err := r.fill(size); err != nil {
+		return nil, err
+	}
+
+	data, err := decodeRecord(r.chunk[:size])
+	if err != nil {
+		return nil, err
+	}
+
+	r.chunk = r.chunk[size:]
+	r.offset += size
+
+	return data, nil
+}
+
+// fill makes at least n bytes available in chunk, fetching from offset when
+// fewer are buffered.
+func (r *recordReader) fill(n int64) error {
+	if int64(len(r.chunk)) >= n {
+		return nil
+	}
+
+	if r.end-r.offset < n {
+		return errShortRecord
+	}
+
+	chunk := make([]byte, min(max(n, readChunkSize), r.end-r.offset))
+
+	read, err := r.src.ReadAt(chunk, r.offset)
+	if read < len(chunk) {
+		if err == nil || errors.Is(err, io.EOF) {
+			return errShortRecord
+		}
+
+		return wrap(err)
+	}
+
+	r.chunk = chunk
+
+	return nil
+}
+
+// appendRecord frames data and appends it to dst. The caller ensures that
+// len(data) <= maxRecordSize.
+func appendRecord(dst, data []byte) []byte {
 	start := len(dst)
-	dst = binary.LittleEndian.AppendUint32(dst, uint32(size))
-	dst = binary.LittleEndian.AppendUint32(dst, checksum(dst[start:start+4], data))
 
-	return append(dst, data...), nil
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(data)))
+	dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(data, crcTable))
+	dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(dst[start:start+8], crcTable))
+
+	return append(dst, data...)
 }
 
-// decodeRecord parses the record at the start of buf. The returned data
-// aliases buf. It fails with errTorn unless buf starts with a complete,
-// intact record.
-func decodeRecord(buf []byte) ([]byte, int, error) {
+// decodeHeader returns the data length of the record starting buf.
+func decodeHeader(buf []byte) (int64, error) {
 	if len(buf) < recordHeaderSize {
-		return nil, 0, errTorn
+		return 0, errShortRecord
 	}
 
-	end := recordHeaderSize + int64(binary.LittleEndian.Uint32(buf[:4]))
+	if crc32.Checksum(buf[:8], crcTable) != binary.LittleEndian.Uint32(buf[8:12]) {
+		return 0, errBadHeader
+	}
+
+	return int64(binary.LittleEndian.Uint32(buf[0:4])), nil
+}
+
+// decodeRecord returns the data of the record starting buf. The result aliases
+// buf with its capacity capped, so appending to it never touches what follows.
+func decodeRecord(buf []byte) ([]byte, error) {
+	length, err := decodeHeader(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	end := recordHeaderSize + length
 	if end > int64(len(buf)) {
-		return nil, 0, errTorn
+		return nil, errShortRecord
 	}
 
-	data := buf[recordHeaderSize:end]
-	if checksum(buf[:4], data) != binary.LittleEndian.Uint32(buf[4:8]) {
-		return nil, 0, errTorn
+	data := buf[recordHeaderSize:end:end]
+	if crc32.Checksum(data, crcTable) != binary.LittleEndian.Uint32(buf[4:8]) {
+		return nil, errBadData
 	}
 
-	return data, int(end), nil
+	return data, nil
+}
+
+// isRecordError reports whether err is a decode failure rather than an I/O one.
+func isRecordError(err error) bool {
+	return errors.Is(err, errShortRecord) || errors.Is(err, errBadHeader) || errors.Is(err, errBadData)
 }
