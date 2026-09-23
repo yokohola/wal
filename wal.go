@@ -9,7 +9,6 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"slices"
 	"sync"
@@ -248,112 +247,38 @@ func (l *Log) Append(data []byte) (uint64, error) {
 // in [FirstIndex, LastIndex+1]. Damage ends the result early, and a Read that
 // starts at damage fails with a *CorruptError naming the records lost.
 func (l *Log) Read(from uint64, limit int) ([]Record, error) {
-	for {
-		recs, unverified, err := l.read(from, limit)
-		if unverified == nil {
-			return recs, err
-		}
-
-		if err := l.verify(unverified); err != nil {
-			return nil, err
-		}
-	}
-}
-
-// read is Read under the read lock. It returns the first unverified segment it
-// reaches instead of reading it.
-func (l *Log) read(from uint64, limit int) ([]Record, *segment, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
 	if l.closed {
-		return nil, nil, ErrClosed
+		return nil, ErrClosed
 	}
 
 	first, next := l.segments[0].first, l.active().nextIndex()
 	if from < first || from > next {
-		return nil, nil, fmt.Errorf("%w: %d outside [%d, %d]", ErrOutOfRange, from, first, next)
+		return nil, fmt.Errorf("%w: %d outside [%d, %d]", ErrOutOfRange, from, first, next)
 	}
 
 	if limit <= 0 || from == next {
-		return []Record{}, nil, nil
+		return []Record{}, nil
 	}
 
 	out := make([]Record, 0, min(uint64(limit), next-from, maxReadPrealloc))
 
 	for i := l.segmentFor(from); i < len(l.segments) && len(out) < limit; i++ {
-		seg := l.segments[i]
-		if !seg.verified {
-			return nil, seg, nil
-		}
-
 		var err error
 
-		out, err = seg.read(from, limit, out)
+		out, err = l.segments[i].read(from, limit, out)
 		if errors.Is(err, ErrCorrupt) && len(out) > 0 {
-			return out, nil, nil
+			return out, nil
 		}
 
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
 
-	return out, nil, nil
-}
-
-// verify checks the trusted part of seg without holding mu, then publishes its
-// index and where its located records end. Reads report the rest as lost.
-func (l *Log) verify(seg *segment) error {
-	seg.verifyMu.Lock()
-	defer seg.verifyMu.Unlock()
-
-	l.mu.RLock()
-	verified, reclaimed := seg.verified, seg.first < l.segments[0].first
-	l.mu.RUnlock()
-
-	if verified || reclaimed {
-		return nil
-	}
-
-	file, err := openSegment(seg.path)
-	if errors.Is(err, fs.ErrNotExist) {
-		l.mu.RLock()
-		reclaimed = seg.first < l.segments[0].first
-		l.mu.RUnlock()
-
-		if reclaimed {
-			return nil
-		}
-	}
-
-	if err != nil {
-		return wrap(err)
-	}
-
-	found, err := seg.scanTrusted(file)
-	if err != nil {
-		_ = file.Close() // read only, nothing to lose
-
-		return err
-	}
-
-	l.mu.Lock()
-	seg.sparseIndex = append(found.entries, seg.sparseIndex...)
-	seg.readableEnd, seg.lost = found.end, found.lost
-	seg.verified = true
-
-	// A closed segment still in the log keeps the file as its reader. Reclaim
-	// and Close take mu before closing readers, so they will close this one.
-	kept := seg.file == nil && !l.closed && seg.first >= l.segments[0].first &&
-		seg.reader.CompareAndSwap(nil, file)
-	l.mu.Unlock()
-
-	if !kept {
-		_ = file.Close() // read only, nothing to lose
-	}
-
-	return nil
+	return out, nil
 }
 
 // Commit durably marks records up to and including index, at most LastIndex,
@@ -419,7 +344,7 @@ func (l *Log) LastIndex() uint64 {
 }
 
 // Size returns the bytes of all segment files, including reclaimed ones whose
-// deletion failed.
+// deletion failed. Index files are not counted.
 func (l *Log) Size() int64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -469,6 +394,8 @@ func (l *Log) Close() error {
 	if err := tail.seal(); err != nil {
 		return errors.Join(err, l.release())
 	}
+
+	tail.saveIndex()
 
 	cp := checkpoint{
 		committed: l.committed,
@@ -731,22 +658,19 @@ func (l *Log) roll() error {
 		return l.fail(err)
 	}
 
+	tail.saveIndex()
+
 	next, err := createSegment(l.dir, tail.nextIndex(), l.cfg.SegmentSize)
 	if err != nil {
 		return l.fail(err)
 	}
 
 	l.mu.Lock()
-	closeErr := tail.close()
 	l.segments = append(l.segments, next)
 	l.size += segmentHeaderSize
 	l.mu.Unlock()
 
 	l.markSynced()
-
-	if closeErr != nil {
-		return l.fail(closeErr)
-	}
 
 	return nil
 }
@@ -765,9 +689,9 @@ func (l *Log) reclaim() error {
 	l.segments = slices.Delete(l.segments, 0, n)
 	l.mu.Unlock()
 
-	// Reads find segments only under mu, so none can use these readers now.
+	// Reads find segments only under mu, so none can use these files now.
 	for _, seg := range l.doomed {
-		seg.closeReader()
+		_ = seg.close() // sealed and synced, nothing to lose
 	}
 
 	var (
@@ -777,7 +701,7 @@ func (l *Log) reclaim() error {
 	)
 
 	for _, seg := range l.doomed {
-		if err = removeFile(seg.path); err != nil {
+		if err = removeSegment(l.dir, seg.first); err != nil {
 			break
 		}
 
@@ -831,20 +755,10 @@ func (l *Log) saveCheckpoint(cp checkpoint) error {
 	return nil
 }
 
-// release closes the active segment without syncing it, closes the readers
-// and unlocks the directory.
+// release closes the segments, the active one without syncing it, and unlocks
+// the directory.
 func (l *Log) release() error {
-	var err error
-
-	for _, seg := range l.segments {
-		seg.closeReader()
-	}
-
-	if tail := l.active(); tail != nil {
-		err = tail.close()
-	}
-
-	return errors.Join(err, l.lock.Close())
+	return errors.Join(closeSegments(l.segments), l.lock.Close())
 }
 
 // startSyncer starts the background sync when SyncInterval is set.

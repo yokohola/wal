@@ -347,6 +347,7 @@ func TestReopen_DeletesSegmentsLeftBelowCheckpoint(t *testing.T) {
 			require.Equal(t, uint64(8), l.Committed())
 			require.Equal(t, uint64(9), l.FirstIndex())
 			require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
+			require.Equal(t, []string{indexName(9)}, indexFiles(t, dir), "indexes go with their segments")
 			requireRecords(t, readAll(t, l), 9, 2)
 		})
 	}
@@ -379,8 +380,8 @@ func TestReopen_RemovesOnlyOwnTempFiles(t *testing.T) {
 	appendN(t, l, 1)
 	require.NoError(t, l.Close())
 
-	own := []string{segmentName(9) + tempExt, checkpointName + tempExt}
-	foreign := []string{"notes.tmp", "9.wal.tmp"}
+	own := []string{segmentName(9) + tempExt, indexName(9) + tempExt, checkpointName + tempExt}
+	foreign := []string{"notes.tmp", "9.wal.tmp", "9.idx.tmp"}
 
 	for _, name := range append(own, foreign...) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0o644))
@@ -398,8 +399,41 @@ func TestReopen_RemovesOnlyOwnTempFiles(t *testing.T) {
 	}
 }
 
+// Index files are deleted with their segments, but a crash or a failed
+// deletion can leave one behind. Open deletes those, and only those.
+func TestReopen_RemovesOrphanIndexes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 10)
+	require.NoError(t, l.Close())
+
+	orphans := []string{indexName(3), indexName(13)}
+	foreign := []string{"3.idx", "notes.idx", indexName(3) + ".bak"}
+
+	for _, name := range append(orphans, foreign...) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("index"), 0o644))
+	}
+
+	l = openLog(t, dir, cfg)
+
+	for _, name := range orphans {
+		require.NoFileExists(t, filepath.Join(dir, name))
+	}
+
+	for _, name := range foreign {
+		require.FileExists(t, filepath.Join(dir, name))
+	}
+
+	require.Equal(t, []string{indexName(1), indexName(5), indexName(9), "3.idx", "notes.idx"}, indexFiles(t, dir))
+	requireRecords(t, readAll(t, l), 1, 10)
+}
+
 // A crash after Commit leaves records the checkpoint does not cover. Open
-// trusts what it covers and scans only the rest.
+// repairs only those: damage in what the checkpoint covers is left for reads
+// to report.
 func TestReopen_ScansOnlyPastCheckpoint(t *testing.T) {
 	t.Parallel()
 
@@ -423,7 +457,7 @@ func TestReopen_ScansOnlyPastCheckpoint(t *testing.T) {
 	trustedDamage := snapshot(t, dir)
 	flipByte(t, filepath.Join(trustedDamage, active), first)
 	l = openLog(t, trustedDamage, cfg)
-	require.Equal(t, uint64(4), l.LastIndex(), "trusted records are not read by Open")
+	require.Equal(t, uint64(4), l.LastIndex(), "damage in trusted records does not fail Open")
 
 	_, err := l.Read(1, 1)
 	require.ErrorIs(t, err, ErrCorrupt)
@@ -462,19 +496,30 @@ func TestReopen_ScansActiveFromStartAfterRoll(t *testing.T) {
 	requireRecords(t, readAll(t, l), 1, 6)
 }
 
-// Trusted records are verified and indexed by concurrent first reads while
-// appends extend the same segment.
-func TestRead_VerifiesTrustedRecordsOnFirstRead(t *testing.T) {
+// Open verifies and indexes every segment, so concurrent reads right after it
+// find their records while appends extend and roll the active segment.
+func TestReopen_ReadsWhileAppending(t *testing.T) {
 	t.Parallel()
 
+	for mode, indexed := range indexModes {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			testReadsWhileAppending(t, indexed)
+		})
+	}
+}
+
+func testReadsWhileAppending(t *testing.T, indexed bool) {
 	const n = 1200
 
-	// Each segment spans several sparse index intervals.
+	// Each segment spans several sparse index intervals, and the active one is
+	// full, so the first append rolls it.
 	dir := t.TempDir()
 	cfg := Config{SegmentSize: segmentOf(400), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, n)
 	require.NoError(t, l.Close())
+	useIndexes(t, dir, indexed, n)
 
 	l = openLog(t, dir, cfg)
 	require.Greater(t, len(l.segments), 2)
@@ -519,76 +564,10 @@ func TestRead_VerifiesTrustedRecordsOnFirstRead(t *testing.T) {
 	}
 }
 
-// Verification runs without the log's lock, so others go on meanwhile.
-func TestRead_VerificationDoesNotBlockOthers(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
-	l := openLog(t, dir, cfg)
-	appendN(t, l, 10)
-	require.NoError(t, l.Close())
-
-	l = openLog(t, dir, cfg)
-	requireRecords(t, readAll(t, l)[8:], 9, 2)
-
-	// Holding verifyMu stands in for a long verification of the first segment.
-	first := l.segments[0]
-	first.verifyMu.Lock()
-
-	type result struct {
-		recs []Record
-		err  error
-	}
-
-	read := make(chan result, 1)
-	go func() {
-		recs, err := l.Read(1, 4)
-		read <- result{recs: recs, err: err}
-	}()
-
-	appendN(t, l, 1)
-	require.Equal(t, uint64(0), l.Committed())
-
-	recs, err := l.Read(5, 2)
-	require.NoError(t, err, "the second segment is verified independently")
-	requireRecords(t, recs, 5, 2)
-
-	first.verifyMu.Unlock()
-
-	got := <-read
-	require.NoError(t, got.err)
-	requireRecords(t, got.recs, 1, 4)
-}
-
-func TestRead_SegmentReclaimedDuringVerification(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
-	l := openLog(t, dir, cfg)
-	appendN(t, l, 10)
-	require.NoError(t, l.Close())
-
-	l = openLog(t, dir, cfg)
-	first := l.segments[0]
-	first.verifyMu.Lock()
-
-	read := make(chan error, 1)
-	go func() {
-		_, err := l.Read(1, 4)
-		read <- err
-	}()
-
-	require.NoError(t, l.Commit(4))
-	require.NoFileExists(t, first.path)
-
-	first.verifyMu.Unlock()
-	require.ErrorIs(t, <-read, ErrOutOfRange)
-}
-
 // Damage in trusted records fails only the records it makes unreadable. Records
 // before it come back as a short result and records after it read normally.
+// These segments are small enough for one index entry, so a bad record header
+// loses the rest of its segment whether or not an index is loaded.
 func TestRead_ReportsLostTrustedRecords(t *testing.T) {
 	t.Parallel()
 
@@ -684,67 +663,80 @@ func TestRead_ReportsLostTrustedRecords(t *testing.T) {
 	}
 
 	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+		for mode, indexed := range indexModes {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				t.Parallel()
 
-			dir := t.TempDir()
-			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
-			l := openLog(t, dir, cfg)
-			appendN(t, l, 10)
-			require.NoError(t, l.Close())
+				dir := t.TempDir()
+				cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
+				l := openLog(t, dir, cfg)
+				appendN(t, l, 10)
+				require.NoError(t, l.Close())
+				useIndexes(t, dir, indexed, 10)
 
-			tc.damage(t, dir)
+				tc.damage(t, dir)
 
-			l = openLog(t, dir, cfg)
+				l = openLog(t, dir, cfg)
 
-			recs, err := l.Read(1, 100)
-			if tc.first == 1 {
-				require.ErrorIs(t, err, ErrCorrupt)
-			} else {
+				recs, err := l.Read(1, 100)
+				if tc.first == 1 {
+					require.ErrorIs(t, err, ErrCorrupt)
+				} else {
+					require.NoError(t, err)
+					requireRecords(t, recs, 1, int(tc.first-1))
+				}
+
+				for from := tc.first; from <= tc.last; from++ {
+					_, err := l.Read(from, 100)
+					require.ErrorIs(t, err, ErrCorrupt)
+					require.ErrorContains(t, err, tc.reason)
+
+					var lost *CorruptError
+					require.ErrorAs(t, err, &lost)
+					require.Equal(t, CorruptError{
+						Path:   path(dir, tc.segment),
+						Offset: tc.offset,
+						First:  tc.first,
+						Last:   tc.last,
+						Err:    lost.Err,
+					}, *lost)
+				}
+
+				recs, err = l.Read(tc.last+1, 100)
 				require.NoError(t, err)
-				requireRecords(t, recs, 1, int(tc.first-1))
-			}
+				requireRecords(t, recs, tc.last+1, int(10-tc.last))
 
-			for from := tc.first; from <= tc.last; from++ {
-				_, err := l.Read(from, 100)
-				require.ErrorIs(t, err, ErrCorrupt)
-				require.ErrorContains(t, err, tc.reason)
-
-				var lost *CorruptError
-				require.ErrorAs(t, err, &lost)
-				require.Equal(t, CorruptError{
-					Path:   path(dir, tc.segment),
-					Offset: tc.offset,
-					First:  tc.first,
-					Last:   tc.last,
-					Err:    lost.Err,
-				}, *lost)
-			}
-
-			recs, err = l.Read(tc.last+1, 100)
-			require.NoError(t, err)
-			requireRecords(t, recs, tc.last+1, int(10-tc.last))
-
-			appendN(t, l, 1)
-			recs, err = l.Read(tc.last+1, 100)
-			require.NoError(t, err)
-			requireRecords(t, recs, tc.last+1, int(11-tc.last))
-		})
+				appendN(t, l, 1)
+				recs, err = l.Read(tc.last+1, 100)
+				require.NoError(t, err)
+				requireRecords(t, recs, tc.last+1, int(11-tc.last))
+			})
+		}
 	}
 }
 
 // Flipping any byte of a trusted segment loses exactly the records it covers:
 // one record for its data, the rest of the segment for a header. No Read ever
 // returns a record under a wrong index. Open checks the active segment's header
-// itself.
+// itself. The segments hold one index entry each, so an index changes nothing.
 func TestRead_EveryFlippedTrustedByteLosesItsRange(t *testing.T) {
 	t.Parallel()
 
+	for mode, indexed := range indexModes {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			testEveryFlippedTrustedByteLosesItsRange(t, indexed)
+		})
+	}
+}
+
+func testEveryFlippedTrustedByteLosesItsRange(t *testing.T, indexed bool) {
 	dir := t.TempDir()
 	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Close())
+	useIndexes(t, dir, indexed, 10)
 
 	for _, first := range []uint64{5, 9} {
 		last := min(first+3, 10)
@@ -833,16 +825,23 @@ func TestRead_ReportsLostWrittenRecords(t *testing.T) {
 func TestRead_ReportsSwappedRecords(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
-	l := openLog(t, dir, cfg)
-	appendN(t, l, 10)
-	require.NoError(t, l.Close())
+	for mode, indexed := range indexModes {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
 
-	swapRecords(t, filepath.Join(dir, segmentName(1)), 2, 3)
+			dir := t.TempDir()
+			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
+			l := openLog(t, dir, cfg)
+			appendN(t, l, 10)
+			require.NoError(t, l.Close())
+			useIndexes(t, dir, indexed, 10)
 
-	l = openLog(t, dir, cfg)
-	require.Equal(t, []uint64{2, 3}, lostIndexes(t, l))
+			swapRecords(t, filepath.Join(dir, segmentName(1)), 2, 3)
+
+			l = openLog(t, dir, cfg)
+			require.Equal(t, []uint64{2, 3}, lostIndexes(t, l))
+		})
+	}
 }
 
 func TestReopen_RejectsSwappedRecordsPastCheckpoint(t *testing.T) {
@@ -888,8 +887,8 @@ func TestRead_TrustedRecordsDoNotShiftLaterOnes(t *testing.T) {
 			l := openLog(t, dir, Config{})
 			require.Equal(t, uint64(tc.claimed), l.LastIndex())
 
-			// The first Read verifies the segment before anything follows the trusted
-			// bytes; the appended records must still be found.
+			// Open verifies the segment before anything follows the trusted bytes;
+			// the appended records must still be found.
 			require.Equal(t, tc.lost, lostIndexes(t, l))
 
 			for range 200 {
@@ -902,36 +901,49 @@ func TestRead_TrustedRecordsDoNotShiftLaterOnes(t *testing.T) {
 	}
 }
 
-// Verification remembers where it stopped locating records, even once the
-// damage is gone. Bad data is found by each Read, so fixing it takes effect.
+// A scan remembers where it stopped locating records, even once the damage is
+// gone. An index locates them without reading them, so each Read finds a bad
+// header, like bad data, and fixing it takes effect.
 func TestRead_RemembersUnlocatedRecords(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
-	l := openLog(t, dir, cfg)
-	appendN(t, l, 10)
-	require.NoError(t, l.Close())
+	for mode, indexed := range indexModes {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
 
-	path := filepath.Join(dir, segmentName(1))
-	header := int64(segmentHeaderSize)
-	data := segmentOf(2) + recordHeaderSize
+			dir := t.TempDir()
+			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
+			l := openLog(t, dir, cfg)
+			appendN(t, l, 10)
+			require.NoError(t, l.Close())
+			useIndexes(t, dir, indexed, 10)
 
-	flipByte(t, path, header)
-	flipByte(t, path, data)
+			path := filepath.Join(dir, segmentName(1))
+			header := int64(segmentHeaderSize)
+			data := segmentOf(2) + recordHeaderSize
 
-	l = openLog(t, dir, cfg)
-	require.Equal(t, []uint64{1, 2, 3, 4}, lostIndexes(t, l))
+			flipByte(t, path, header)
+			flipByte(t, path, data)
 
-	flipByte(t, path, header)
-	require.Equal(t, []uint64{1, 2, 3, 4}, lostIndexes(t, l), "unlocated records stay lost")
+			l = openLog(t, dir, cfg)
+			require.Equal(t, []uint64{1, 2, 3, 4}, lostIndexes(t, l))
 
-	require.NoError(t, l.Close())
-	l = openLog(t, dir, cfg)
-	require.Equal(t, []uint64{3}, lostIndexes(t, l), "a new verification locates them")
+			flipByte(t, path, header)
 
-	flipByte(t, path, data)
-	require.Empty(t, lostIndexes(t, l))
+			if indexed {
+				require.Equal(t, []uint64{3}, lostIndexes(t, l), "an index finds the header fixed")
+			} else {
+				require.Equal(t, []uint64{1, 2, 3, 4}, lostIndexes(t, l), "unlocated records stay lost")
+			}
+
+			require.NoError(t, l.Close())
+			l = openLog(t, dir, cfg)
+			require.Equal(t, []uint64{3}, lostIndexes(t, l), "a new verification locates them")
+
+			flipByte(t, path, data)
+			require.Empty(t, lostIndexes(t, l))
+		})
+	}
 }
 
 // Bytes past the last trusted record of a closed segment hold no record.
@@ -943,19 +955,235 @@ func TestRead_IgnoresBytesAfterTrustedRecords(t *testing.T) {
 		"zeros":   make([]byte, 100),
 		"record":  appendRecord(nil, 5, payload(5)),
 	} {
+		for mode, indexed := range indexModes {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				t.Parallel()
+
+				dir := t.TempDir()
+				cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
+				l := openLog(t, dir, cfg)
+				appendN(t, l, 10)
+				require.NoError(t, l.Close())
+				useIndexes(t, dir, indexed, 10)
+
+				appendBytes(t, filepath.Join(dir, segmentName(1)), extra)
+
+				l = openLog(t, dir, cfg)
+				require.Empty(t, lostIndexes(t, l))
+			})
+		}
+	}
+}
+
+// bigLog is a closed log whose segments span several sparse index entries:
+// segments 1 and 401 hold 400 records each and the active segment 801 holds
+// 200. Entries fall every 171 records, at indexes 1, 172 and 343 of the first.
+const (
+	bigLogRecords  = 1000
+	bigLogInterval = 171
+)
+
+var bigLogConfig = Config{SegmentSize: segmentOf(400), MaxRecordSize: payloadSize}
+
+// writeBigLog writes bigLog into a new directory with index files for mode.
+func writeBigLog(t *testing.T, indexed bool) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	l := openLog(t, dir, bigLogConfig)
+	appendN(t, l, bigLogRecords)
+
+	entries := l.segments[0].sparseIndex
+	require.Len(t, entries, 3)
+	require.Equal(t, uint64(1+bigLogInterval), entries[1].index)
+
+	require.NoError(t, l.Close())
+	useIndexes(t, dir, indexed, bigLogRecords)
+
+	return dir
+}
+
+// A bad record header loses the records up to the next entry of an index, and
+// up to the end of the segment for a scan, which cannot resync past it.
+func TestRead_IndexNarrowsLossFromBadHeader(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		segment, index       uint64
+		indexedLast, scanned uint64
+	}{
+		"closed segment":            {segment: 401, index: 450, indexedLast: 401 + bigLogInterval - 1, scanned: 800},
+		"active segment":            {segment: 801, index: 850, indexedLast: 801 + bigLogInterval - 1, scanned: 1000},
+		"closed segment last entry": {segment: 1, index: 350, indexedLast: 400, scanned: 400},
+	}
+
+	for name, tc := range cases {
+		for mode, indexed := range indexModes {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				t.Parallel()
+
+				dir := writeBigLog(t, indexed)
+				flipByte(t, filepath.Join(dir, segmentName(tc.segment)), segmentOf(int(tc.index-tc.segment))+recordHeaderSize-1)
+
+				last := tc.scanned
+				if indexed {
+					last = tc.indexedLast
+				}
+
+				l := openLog(t, dir, bigLogConfig)
+				require.Equal(t, lostRange(tc.index, last), lostIndexes(t, l))
+			})
+		}
+	}
+}
+
+// An index that does not match its segment is ignored, so reads give exactly
+// what a scan gives. A bad header in segment 1 tells the two apart: a scan loses
+// every record after it, a matching index only those up to its next entry.
+func TestRead_RejectedIndexFallsBackToScan(t *testing.T) {
+	t.Parallel()
+
+	const damaged = 50
+
+	// rewrite replaces the index of segment 1 with what edit makes of its
+	// entries, validly encoded.
+	rewrite := func(edit func(entries []indexEntry) (first uint64, end int64, next uint64, out []indexEntry)) func(t *testing.T, path string) {
+		return func(t *testing.T, path string) {
+			t.Helper()
+
+			entries, err := readIndex(path, 1, segmentOf(400), 401)
+			require.NoError(t, err)
+
+			first, end, next, out := edit(entries)
+			require.NoError(t, os.WriteFile(path, encodeIndex(first, end, next, out), 0o644))
+		}
+	}
+
+	cases := map[string]func(t *testing.T, path string){
+		"missing": func(t *testing.T, path string) {
+			t.Helper()
+			require.NoError(t, os.Remove(path))
+		},
+		"empty": func(t *testing.T, path string) {
+			t.Helper()
+			require.NoError(t, os.Truncate(path, 0))
+		},
+		"torn": func(t *testing.T, path string) {
+			t.Helper()
+
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			require.NoError(t, os.Truncate(path, info.Size()-indexEntrySize))
+		},
+		"flipped entry byte": func(t *testing.T, path string) {
+			t.Helper()
+			flipByte(t, path, indexHeaderSize+indexEntrySize+3)
+		},
+		"a directory": func(t *testing.T, path string) {
+			t.Helper()
+			require.NoError(t, os.Remove(path))
+			require.NoError(t, os.Mkdir(path, 0o755))
+		},
+		"index of another segment": func(t *testing.T, path string) {
+			t.Helper()
+
+			data, err := os.ReadFile(filepath.Join(filepath.Dir(path), indexName(401)))
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(path, data, 0o644))
+		},
+		"stale end": rewrite(func(entries []indexEntry) (uint64, int64, uint64, []indexEntry) {
+			return 1, segmentOf(399), 400, entries
+		}),
+		"stale next": rewrite(func(entries []indexEntry) (uint64, int64, uint64, []indexEntry) {
+			return 1, segmentOf(400), 400, entries
+		}),
+		"first record not indexed": rewrite(func(entries []indexEntry) (uint64, int64, uint64, []indexEntry) {
+			return 1, segmentOf(400), 401, entries[1:]
+		}),
+		"entries out of order": rewrite(func(entries []indexEntry) (uint64, int64, uint64, []indexEntry) {
+			entries[1], entries[2] = entries[2], entries[1]
+
+			return 1, segmentOf(400), 401, entries
+		}),
+	}
+
+	for name, damage := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			dir := t.TempDir()
-			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
-			l := openLog(t, dir, cfg)
-			appendN(t, l, 10)
-			require.NoError(t, l.Close())
+			dir := writeBigLog(t, true)
+			path := filepath.Join(dir, indexName(1))
+			damage(t, path)
+			flipByte(t, filepath.Join(dir, segmentName(1)), segmentOf(damaged-1))
 
-			appendBytes(t, filepath.Join(dir, segmentName(1)), extra)
+			_, err := readIndex(path, 1, segmentOf(400), 401)
+			require.Error(t, err, "the index is rejected")
 
-			l = openLog(t, dir, cfg)
-			require.Empty(t, lostIndexes(t, l))
+			l := openLog(t, dir, bigLogConfig)
+			require.Equal(t, lostRange(damaged, 400), lostIndexes(t, l))
+		})
+	}
+}
+
+// Every byte of an index is covered by its checksum, so no flip is loaded.
+func TestRead_EveryFlippedIndexByteFallsBackToScan(t *testing.T) {
+	t.Parallel()
+
+	const damaged = 50
+
+	dir := writeBigLog(t, true)
+	flipByte(t, filepath.Join(dir, segmentName(1)), segmentOf(damaged-1))
+
+	info, err := os.Stat(filepath.Join(dir, indexName(1)))
+	require.NoError(t, err)
+	require.Equal(t, int64(indexHeaderSize+3*indexEntrySize+indexCRCSize), info.Size())
+
+	for offset := range info.Size() {
+		flippedDir := snapshot(t, dir)
+		flipByte(t, filepath.Join(flippedDir, indexName(1)), offset)
+
+		l := openLog(t, flippedDir, bigLogConfig)
+
+		// Record 172 follows the second entry, so only the index locates it.
+		_, err := l.Read(1+bigLogInterval, 1)
+		require.ErrorIs(t, err, ErrCorrupt, "flip at %d", offset)
+		require.NoError(t, l.Close())
+	}
+}
+
+// An intact index is trusted as far as its checks go. A wrong entry that passes
+// them makes reads that start from it fail as corruption, since a record's
+// checksum covers its index, and never returns a record under a wrong index.
+func TestRead_WrongIndexEntryNeverReturnsWrongData(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		shift int64 // bytes the second entry of segment 1 is moved by
+		lost  []uint64
+	}{
+		"one record late":   {shift: testRecordSize, lost: lostRange(1+bigLogInterval, 2*bigLogInterval)},
+		"inside the record": {shift: 5, lost: lostRange(1+bigLogInterval, 2*bigLogInterval)},
+		"one record early":  {shift: -testRecordSize, lost: lostRange(1+bigLogInterval, 2*bigLogInterval)},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := writeBigLog(t, true)
+			path := filepath.Join(dir, indexName(1))
+
+			entries, err := readIndex(path, 1, segmentOf(400), 401)
+			require.NoError(t, err)
+
+			entries[1].offset += tc.shift
+			require.NoError(t, os.WriteFile(path, encodeIndex(1, segmentOf(400), 401, entries), 0o644))
+
+			_, err = readIndex(path, 1, segmentOf(400), 401)
+			require.NoError(t, err, "the wrong entry passes the checks")
+
+			l := openLog(t, dir, bigLogConfig)
+			require.Equal(t, tc.lost, lostIndexes(t, l))
 		})
 	}
 }
@@ -1007,6 +1235,45 @@ func lostRange(first, last uint64) []uint64 {
 	}
 
 	return out
+}
+
+// indexModes are the two ways a reopened log verifies a trusted segment: from
+// its index file, or by a scan once the index files are deleted.
+var indexModes = map[string]bool{"indexed": true, "scanned": false}
+
+// useIndexes prepares dir, holding a closed log with records up to last, for a
+// mode: it checks that every segment with records has an index that matches
+// it, and deletes them all unless indexed.
+func useIndexes(t *testing.T, dir string, indexed bool, last uint64) {
+	t.Helper()
+
+	firsts, err := listSegments(dir)
+	require.NoError(t, err)
+
+	for i, first := range firsts {
+		info, err := os.Stat(filepath.Join(dir, segmentName(first)))
+		require.NoError(t, err)
+
+		path := filepath.Join(dir, indexName(first))
+
+		if info.Size() == segmentHeaderSize {
+			require.NoFileExists(t, path)
+
+			continue
+		}
+
+		next := last + 1
+		if i+1 < len(firsts) {
+			next = firsts[i+1]
+		}
+
+		_, err = readIndex(path, first, info.Size(), next)
+		require.NoError(t, err)
+
+		if !indexed {
+			require.NoError(t, os.Remove(path))
+		}
+	}
 }
 
 // snapshot copies the files of dir, as a crash would leave them, to a new

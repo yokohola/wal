@@ -393,8 +393,10 @@ func TestRead_PointReadFetchesOneIndexGap(t *testing.T) {
 	require.Less(t, perRead, uint64(2*sparseInterval))
 }
 
+// A segment keeps one file while in the log: a sealed segment the one it was
+// written through, a closed segment the one Open opened. Reads open none.
 // Segments 1 and 5 are closed; 9 is active.
-func TestRead_OpensClosedSegmentOnce(t *testing.T) {
+func TestRead_OpensNoFiles(t *testing.T) {
 	opens := trackOpens(t)
 
 	dir := t.TempDir()
@@ -416,45 +418,52 @@ func TestRead_OpensClosedSegmentOnce(t *testing.T) {
 	}
 
 	readRanges(l)
-	require.Equal(t, 2, opens.count(), "one open per closed segment, none for the active one")
-	require.Equal(t, 2, opens.stillOpen())
+	require.Zero(t, opens.count(), "sealed segments keep the file they were written through")
 
 	require.NoError(t, l.Close())
-	require.Zero(t, opens.stillOpen(), "Close closes the readers")
 
-	// Reopened, every segment is trusted and the first read verifies it. The
-	// closed ones keep the file verification opened; the active one closes it.
-	l = openLog(t, dir, cfg)
-	require.Equal(t, 2, opens.count())
-
-	readRanges(l)
-	require.Equal(t, 5, opens.count())
-	require.Equal(t, 2, opens.stillOpen())
-
-	for _, seg := range l.segments[:2] {
-		require.NotNil(t, seg.reader.Load())
+	for _, seg := range l.segments {
+		require.Nil(t, seg.file, "Close closes every segment")
 	}
 
-	require.Nil(t, l.segments[2].reader.Load(), "the active segment reads its own file")
+	l = openLog(t, dir, cfg)
+	require.Equal(t, 2, opens.count(), "Open opens each closed segment once")
+	require.Equal(t, 2, opens.stillOpen())
+
+	readRanges(l)
+	require.Equal(t, 2, opens.count(), "reads open nothing")
 
 	require.NoError(t, l.Close())
 	require.Zero(t, opens.stillOpen())
 }
 
-// A segment that leaves the log, or a log that closes, while verification runs
-// must not keep the file verification opened: nothing would close it later.
-func TestRead_VerificationDropsFileOfGoneSegment(t *testing.T) {
+// Open verifies closed segments, so an I/O failure there fails Open, which
+// closes the files it opened. A directory in place of segment 5 opens, but
+// reading it fails.
+func TestOpen_VerificationFailureClosesFiles(t *testing.T) {
 	cases := map[string]struct {
-		leave   func(t *testing.T, l *Log)
-		readErr error
+		damage func(t *testing.T, dir string, opens *openTracker)
+		err    error
+		opened int
 	}{
-		"reclaimed": {
-			leave:   func(t *testing.T, l *Log) { require.NoError(t, l.Commit(4)) },
-			readErr: ErrOutOfRange,
+		"unreadable segment": {
+			damage: func(t *testing.T, dir string, _ *openTracker) {
+				t.Helper()
+
+				path := filepath.Join(dir, segmentName(5))
+				require.NoError(t, os.Remove(path))
+				require.NoError(t, os.Mkdir(path, 0o755))
+			},
+			err:    syscall.EISDIR,
+			opened: 2,
 		},
-		"log closed": {
-			leave:   func(t *testing.T, l *Log) { require.NoError(t, l.Close()) },
-			readErr: ErrClosed,
+		"failed open": {
+			damage: func(t *testing.T, _ string, opens *openTracker) {
+				t.Helper()
+
+				opens.fail = syscall.EMFILE
+			},
+			err: syscall.EMFILE,
 		},
 	}
 
@@ -468,156 +477,29 @@ func TestRead_VerificationDropsFileOfGoneSegment(t *testing.T) {
 			appendN(t, l, 12)
 			require.NoError(t, l.Close())
 
-			l, err := Open(dir, cfg)
-			require.NoError(t, err)
+			tc.damage(t, dir, opens)
 
-			// Verification of segment 1 opens its file, then waits.
-			opened, resume := make(chan struct{}), make(chan struct{})
-			opens.onOpen = func() {
-				close(opened)
-				<-resume
-			}
+			_, err := Open(dir, cfg)
+			require.ErrorIs(t, err, tc.err)
+			require.NotErrorIs(t, err, ErrCorrupt)
+			require.Equal(t, tc.opened, opens.count())
+			require.Zero(t, opens.stillOpen())
 
-			result := make(chan error, 1)
+			opens.fail = nil
 
-			go func() {
-				_, err := l.Read(1, 1)
-				result <- err
-			}()
+			l, err = Open(dir, cfg)
+			require.NotErrorIs(t, err, ErrLocked, "the failed Open released the directory")
 
-			<-opened
-			opens.onOpen = nil
-			tc.leave(t, l)
-			close(resume)
-
-			require.ErrorIs(t, <-result, tc.readErr)
-			require.Equal(t, 1, opens.count())
-			require.Zero(t, opens.stillOpen(), "verification closed the file it could not hand over")
-
-			if !l.closed {
+			if err == nil {
 				require.NoError(t, l.Close())
 			}
 		})
 	}
 }
 
-// A directory in place of a closed segment opens, but reading it fails with an
-// I/O error rather than damage. Every Read retries verification, so each failed
-// attempt must close its file.
-func TestRead_FailedVerificationClosesFile(t *testing.T) {
-	opens := trackOpens(t)
-
-	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
-	l := openLog(t, dir, cfg)
-	appendN(t, l, 12)
-	require.NoError(t, l.Close())
-
-	l = openLog(t, dir, cfg)
-
-	path := filepath.Join(dir, segmentName(1))
-	require.NoError(t, os.Remove(path))
-	require.NoError(t, os.Mkdir(path, 0o755))
-
-	for range 5 {
-		_, err := l.Read(1, 1)
-		require.ErrorIs(t, err, syscall.EISDIR)
-		require.NotErrorIs(t, err, ErrCorrupt)
-	}
-
-	require.Equal(t, 5, opens.count())
-	require.Zero(t, opens.stillOpen())
-	require.Nil(t, l.segments[0].reader.Load())
-	require.False(t, l.segments[0].verified)
-
-	recs, err := l.Read(5, 8)
-	require.NoError(t, err)
-	requireRecords(t, recs, 5, 8)
-}
-
-func TestRead_RacingFirstReadsKeepOneReader(t *testing.T) {
-	const readers = 16
-
-	opens := trackOpens(t)
-
-	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize})
-	appendN(t, l, 8)
-
-	// Every reader waits inside its open until all have opened, so all of them
-	// race to store their file. Later opens do not wait.
-	var arrived atomic.Int32
-
-	all := make(chan struct{})
-	opens.onOpen = func() {
-		switch n := arrived.Add(1); {
-		case n == readers:
-			close(all)
-		case n > readers:
-			return
-		}
-
-		select {
-		case <-all:
-		case <-time.After(10 * time.Second):
-		}
-	}
-
-	results := make([][]Record, readers)
-	errs := make([]error, readers)
-
-	var wg sync.WaitGroup
-
-	for i := range readers {
-		wg.Go(func() {
-			results[i], errs[i] = l.Read(1, 4)
-		})
-	}
-
-	wg.Wait()
-
-	for i := range readers {
-		require.NoError(t, errs[i])
-		requireRecords(t, results[i], 1, 4)
-	}
-
-	require.Equal(t, readers, opens.count())
-	require.Equal(t, 1, opens.stillOpen(), "the losers close their files")
-
-	kept := l.segments[0].reader.Load()
-	require.NotNil(t, kept)
-	require.True(t, isOpen(kept), "the stored file is the one left open")
-
-	recs, err := l.Read(1, 4)
-	require.NoError(t, err)
-	requireRecords(t, recs, 1, 4)
-	require.Equal(t, readers, opens.count(), "later reads reuse the stored file")
-}
-
-func TestRead_FailedOpenIsRetried(t *testing.T) {
-	opens := trackOpens(t)
-
-	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize})
-	appendN(t, l, 8)
-
-	injected := errors.New("injected open failure")
-	opens.fail = injected
-
-	_, err := l.Read(1, 1)
-	require.ErrorIs(t, err, injected)
-	require.NotErrorIs(t, err, ErrCorrupt)
-	require.Nil(t, l.segments[0].reader.Load(), "a failed open stores nothing")
-
-	opens.fail = nil
-
-	recs, err := l.Read(1, 4)
-	require.NoError(t, err)
-	requireRecords(t, recs, 1, 4)
-	require.Equal(t, 1, opens.count())
-}
-
 // Records are read back while a writer appends and commits, so reads keep
 // racing segments being rolled and reclaimed. A read never sees a closed
-// reader: it gets its records or, once they are reclaimed, ErrOutOfRange.
+// file: it gets its records or, once they are reclaimed, ErrOutOfRange.
 func TestConcurrent_ReadsDuringReclaim(t *testing.T) {
 	t.Parallel()
 
@@ -771,15 +653,15 @@ func TestRead_DoesNotWaitForSync(t *testing.T) {
 	require.Equal(t, uint64(3), l.LastIndex())
 }
 
-// Segments 1 and 5 are closed and read; 9 is active.
-func TestCommit_ReclaimClosesReaders(t *testing.T) {
-	opens := trackOpens(t)
+// Segments 1 and 5 are closed; 9 is active.
+func TestCommit_ReclaimClosesFiles(t *testing.T) {
+	t.Parallel()
 
 	dir := t.TempDir()
 	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize})
 	appendN(t, l, 12)
-	requireRecords(t, readAll(t, l), 1, 12)
-	require.Equal(t, 2, opens.stillOpen())
+
+	files := []*os.File{l.segments[0].file, l.segments[1].file}
 
 	// Removing segment 1 fails, so reclaim stops before it reaches segment 5.
 	blocked := filepath.Join(dir, segmentName(1))
@@ -788,15 +670,16 @@ func TestCommit_ReclaimClosesReaders(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(blocked, "file"), nil, 0o644))
 
 	require.Error(t, l.Commit(8))
-	require.Zero(t, opens.stillOpen(), "reclaimed segments close their readers even when deletion fails")
-	require.Nil(t, l.doomed[0].reader.Load())
-	require.Nil(t, l.doomed[1].reader.Load())
+
+	for i, file := range files {
+		require.False(t, isOpen(file), "reclaimed segments close their files even when deletion fails")
+		require.Nil(t, l.doomed[i].file)
+	}
 
 	require.NoError(t, os.Remove(filepath.Join(blocked, "file")))
 	require.NoError(t, l.Commit(8))
 	require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
 	requireRecords(t, readAll(t, l), 9, 4)
-	require.Equal(t, 2, opens.count(), "the active segment needs no reader")
 }
 
 func TestCommit_PersistsAndReclaims(t *testing.T) {
@@ -815,6 +698,7 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 	require.Equal(t, uint64(5), l.Committed())
 	require.Equal(t, uint64(5), l.FirstIndex())
 	require.Equal(t, []string{segmentName(5), segmentName(9)}, segmentFiles(t, dir))
+	require.Equal(t, []string{indexName(5)}, indexFiles(t, dir))
 	require.Equal(t, 2*segmentHeaderSize+6*int64(testRecordSize), l.Size())
 
 	require.NoError(t, l.Commit(3), "a lower index is a no-op")
@@ -824,6 +708,7 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 
 	require.NoError(t, l.Commit(10))
 	require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir), "the active segment stays")
+	require.Empty(t, indexFiles(t, dir))
 	require.Equal(t, uint64(9), l.FirstIndex())
 	require.Equal(t, uint64(10), l.LastIndex())
 
@@ -891,6 +776,36 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 	require.NoError(t, l.Commit(8))
 	require.Equal(t, uint64(9), l.FirstIndex())
 	require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
+	require.Equal(t, segmentHeaderSize+2*int64(testRecordSize), l.Size())
+}
+
+// An index is deleted before its segment, so a failure to delete it keeps the
+// segment and its bytes until a retry deletes both.
+func TestCommit_RetryAfterIndexRemovalFails(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize})
+	appendN(t, l, 10)
+
+	blocked := filepath.Join(dir, indexName(1))
+	require.NoError(t, os.Remove(blocked))
+	require.NoError(t, os.Mkdir(blocked, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(blocked, "file"), nil, 0o644))
+
+	size := l.Size()
+
+	require.Error(t, l.Commit(8))
+	require.Equal(t, uint64(9), l.FirstIndex())
+	require.Equal(t, size, l.Size(), "the segment is not deleted")
+	require.Equal(t, []string{segmentName(1), segmentName(5), segmentName(9)}, segmentFiles(t, dir))
+
+	require.NoError(t, os.Remove(filepath.Join(blocked, "file")))
+
+	require.NoError(t, l.Commit(8))
+	require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
+	require.NoDirExists(t, blocked)
+	require.Empty(t, indexFiles(t, dir))
 	require.Equal(t, segmentHeaderSize+2*int64(testRecordSize), l.Size())
 }
 
@@ -1366,6 +1281,62 @@ func BenchmarkReadPointClosed(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkLoadClosedSegment measures what Open spends on each closed
+// default-size segment: loading its index, or scanning it when the index is
+// missing, which then writes the index again.
+func BenchmarkLoadClosedSegment(b *testing.B) {
+	dir := b.TempDir()
+
+	l, err := Open(dir, Config{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	data := make([]byte, 160)
+
+	for len(l.segments) < 2 {
+		if _, err := l.Append(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	first, next := l.segments[0].first, l.segments[1].first
+
+	if err := l.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	load := func(b *testing.B, before func()) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			if before != nil {
+				b.StopTimer()
+				before()
+				b.StartTimer()
+			}
+
+			seg, err := loadClosedSegment(dir, first, next)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			if err := seg.close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	b.Run("indexed", func(b *testing.B) { load(b, nil) })
+	b.Run("scanned", func(b *testing.B) {
+		load(b, func() {
+			if err := os.Remove(filepath.Join(dir, indexName(first))); err != nil {
+				b.Fatal(err)
+			}
+		})
+	})
 }
 
 func payload(index uint64) []byte {

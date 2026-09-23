@@ -320,11 +320,13 @@ func TestSegmentName_RoundTrip(t *testing.T) {
 func TestIsTempName(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"00000000000000000001.wal.tmp", "checkpoint.tmp"} {
+	for _, name := range []string{"00000000000000000001.wal.tmp", "00000000000000000001.idx.tmp", "checkpoint.tmp"} {
 		require.True(t, isTempName(name), name)
 	}
 
-	for _, name := range []string{"notes.tmp", "1.wal.tmp", "checkpoint", "00000000000000000001.wal", "LOCK.tmp"} {
+	for _, name := range []string{
+		"notes.tmp", "1.wal.tmp", "1.idx.tmp", "checkpoint", "00000000000000000001.wal", "00000000000000000001.idx", "LOCK.tmp",
+	} {
 		require.False(t, isTempName(name), name)
 	}
 }

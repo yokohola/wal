@@ -18,15 +18,16 @@ const sectorSize = 512
 var zeroSector [sectorSize]byte
 
 // listSegments returns the first indexes of the segments in dir, ascending. It
-// deletes the temp files a crash leaves while a segment or the checkpoint is
-// written and leaves every other file alone.
+// deletes the temp files a crash leaves while a segment, an index or the
+// checkpoint is written, and index files whose segment is gone. It leaves every
+// other file alone.
 func listSegments(dir string) ([]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, wrap(err)
 	}
 
-	var firsts []uint64
+	var firsts, indexed []uint64
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -41,12 +42,32 @@ func listSegments(dir string) ([]uint64, error) {
 
 		if first, ok := parseSegmentName(name); ok {
 			firsts = append(firsts, first)
+		} else if first, ok := parseIndexName(name); ok {
+			indexed = append(indexed, first)
 		}
 	}
 
 	slices.Sort(firsts)
 
+	for _, first := range indexed {
+		if _, found := slices.BinarySearch(firsts, first); !found {
+			if err := removeFile(filepath.Join(dir, indexName(first))); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return firsts, nil
+}
+
+// removeSegment deletes the segment starting at first and its index. The index
+// goes first, so a crash in between never leaves an index without its segment.
+func removeSegment(dir string, first uint64) error {
+	if err := removeFile(filepath.Join(dir, indexName(first))); err != nil {
+		return err
+	}
+
+	return removeFile(filepath.Join(dir, segmentName(first)))
 }
 
 // loadSegments validates segments against the checkpoint and opens the last.
@@ -79,27 +100,28 @@ func loadSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([
 		return nil, errors.Join(
 			fmt.Errorf("%w: checkpoint %d is past the last record %d",
 				ErrCorrupt, cp.committed, active.nextIndex()-1),
-			active.close())
+			closeSegments(segments))
 	}
 
 	for _, first := range firsts[:len(firsts)-len(live)] {
-		if err := removeFile(filepath.Join(dir, segmentName(first))); err != nil {
-			return nil, errors.Join(err, active.close())
+		if err := removeSegment(dir, first); err != nil {
+			return nil, errors.Join(err, closeSegments(segments))
 		}
 	}
 
 	return segments, nil
 }
 
-// openSegments loads contiguous segments and opens the last for appending.
+// openSegments loads contiguous segments, verified, and opens the last for
+// appending. On failure it closes what it opened.
 func openSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([]*segment, error) {
 	last := len(firsts) - 1
 	segments := make([]*segment, 0, len(firsts))
 
 	for i, first := range firsts[:last] {
-		seg, err := trustClosedSegment(dir, first, firsts[i+1])
+		seg, err := loadClosedSegment(dir, first, firsts[i+1])
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, closeSegments(segments))
 		}
 
 		segments = append(segments, seg)
@@ -107,29 +129,58 @@ func openSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([
 
 	active, err := recoverActiveSegment(dir, firsts[last], cp, prealloc)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, closeSegments(segments))
 	}
 
 	return append(segments, active), nil
 }
 
-// trustClosedSegment accepts a segment unread: it was sealed before the next
-// one was created, so a crash cannot have torn it.
-func trustClosedSegment(dir string, first, next uint64) (*segment, error) {
+// closeSegments closes the files of segments.
+func closeSegments(segments []*segment) error {
+	var err error
+
+	for _, seg := range segments {
+		err = errors.Join(err, seg.close())
+	}
+
+	return err
+}
+
+// loadClosedSegment opens a closed segment for reading and verifies all of it.
+// It was sealed before the next one was created, so a crash cannot have torn
+// it. A segment verified without its index gets one for the next Open.
+func loadClosedSegment(dir string, first, next uint64) (*segment, error) {
 	seg := newSegment(dir, first)
 
-	info, err := os.Stat(seg.path)
+	file, err := openSegment(seg.path)
 	if err != nil {
 		return nil, wrap(err)
 	}
 
+	seg.file = file
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, errors.Join(wrap(err), seg.close())
+	}
+
 	seg.trust(info.Size(), next)
+
+	indexed, err := seg.verify()
+	if err != nil {
+		return nil, errors.Join(err, seg.close())
+	}
+
+	if !indexed {
+		seg.saveIndex()
+	}
 
 	return seg, nil
 }
 
-// recoverActiveSegment opens the last segment for appending, scanning only past
-// the checkpoint. A torn tail is truncated and synced before any append.
+// recoverActiveSegment opens the last segment for appending, scanning past the
+// checkpoint. A torn tail is truncated and synced before any append. Records
+// the checkpoint covers are verified like a closed segment's.
 func recoverActiveSegment(
 	dir string, first uint64, cp checkpoint, prealloc int64,
 ) (*segment, error) {
@@ -145,6 +196,10 @@ func recoverActiveSegment(
 	}
 
 	seg.file = file
+
+	if _, err := seg.verify(); err != nil {
+		return nil, errors.Join(err, seg.close())
+	}
 
 	return seg, nil
 }
@@ -248,8 +303,8 @@ func hasZeroSector(buf []byte, offset int64) bool {
 	return false
 }
 
-// isTempName reports whether name is a segment or checkpoint temp file that
-// this package writes before a rename.
+// isTempName reports whether name is a segment, index or checkpoint temp file
+// that this package writes before a rename.
 func isTempName(name string) bool {
 	base, ok := strings.CutSuffix(name, tempExt)
 	if !ok {
@@ -257,6 +312,7 @@ func isTempName(name string) bool {
 	}
 
 	_, isSegment := parseSegmentName(base)
+	_, isIndex := parseIndexName(base)
 
-	return isSegment || base == checkpointName
+	return isSegment || isIndex || base == checkpointName
 }
