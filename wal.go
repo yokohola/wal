@@ -64,14 +64,12 @@ type Config struct {
 	// SegmentSize bytes exceeds it by that record's framing.
 	SegmentSize int64
 
-	// MaxWALSize caps Size, the bytes of all segments. Append fails with ErrFull
-	// while a record does not fit. Zero means no cap; otherwise it must be at
-	// least SegmentSize.
+	// MaxWALSize caps Size; Append fails with ErrFull while a record does not
+	// fit. Zero means no cap, otherwise it must be at least SegmentSize.
 	MaxWALSize int64
 
-	// MaxRecordSize caps the data of one record; Append rejects a larger one
-	// with ErrTooLarge. It must not exceed SegmentSize. Records already on disk
-	// stay readable when it shrinks.
+	// MaxRecordSize caps one record's data, at most SegmentSize; Append rejects a
+	// larger one with ErrTooLarge. Lowering it keeps existing records readable.
 	MaxRecordSize int64
 
 	// SyncOnAppend makes every Append durable before it returns. Concurrent
@@ -89,8 +87,8 @@ type Record struct {
 	Data  []byte
 }
 
-// Log is an append-only log in one directory; create it with Open and do not
-// copy it. Methods are safe for concurrent use, and reads never wait on writes.
+// Log is an append-only log in one directory, created with Open, never copied,
+// safe for concurrent use; reads never wait on writes.
 //
 // Invariants: segments hold contiguous indexes, only the last one takes
 // appends, FirstIndex-1 <= Committed <= LastIndex, and committed records are
@@ -164,6 +162,7 @@ func Open(dir string, cfg Config) (*Log, error) {
 	return l, nil
 }
 
+// withDefaults fills zero fields with defaults and validates the result.
 func (c Config) withDefaults() (Config, error) {
 	if c.SegmentSize < 0 || c.MaxWALSize < 0 || c.MaxRecordSize < 0 || c.SyncInterval < 0 {
 		return c, fmt.Errorf("%w: negative value", ErrInvalidConfig)
@@ -195,22 +194,24 @@ func (c Config) withDefaults() (Config, error) {
 	return c, nil
 }
 
+// Error describes the damage and the records it makes unreadable.
 func (e *CorruptError) Error() string {
 	return fmt.Sprintf("%v: %s at offset %d, records %d to %d: %v",
 		ErrCorrupt, e.Path, e.Offset, e.First, e.Last, e.Err)
 }
 
+// Is makes a CorruptError match ErrCorrupt.
 func (e *CorruptError) Is(target error) bool {
 	return target == ErrCorrupt
 }
 
+// Unwrap returns the decode failure behind the damage.
 func (e *CorruptError) Unwrap() error {
 	return e.Err
 }
 
-// Append writes data as one record and returns its index. The record is atomic:
-// after a crash it is either whole or absent, never partial. A record whose
-// Append failed may still survive a crash.
+// Append writes data as one record and returns its index. After a crash the
+// record is whole or absent, and one whose Append failed may still survive.
 func (l *Log) Append(data []byte) (uint64, error) {
 	size, err := l.recordSize(data)
 	if err != nil {
@@ -243,11 +244,8 @@ func (l *Log) Append(data []byte) (uint64, error) {
 	return req.index, req.err
 }
 
-// Read returns up to limit records from index from, which must lie in
-// [FirstIndex, LastIndex+1]; at LastIndex+1 it returns none. The caller owns the
-// data, and no slice's capacity reaches into another record.
-//
-// Damage on disk ends the result early at the last intact record. A Read that
+// Read returns up to limit caller-owned records from index from, which must lie
+// in [FirstIndex, LastIndex+1]. Damage ends the result early, and a Read that
 // starts at damage fails with a *CorruptError naming the records lost.
 func (l *Log) Read(from uint64, limit int) ([]Record, error) {
 	for {
@@ -318,7 +316,7 @@ func (l *Log) verify(seg *segment) error {
 		return nil
 	}
 
-	found, err := seg.scanTrusted()
+	file, err := openSegment(seg.path)
 	if errors.Is(err, fs.ErrNotExist) {
 		l.mu.RLock()
 		reclaimed = seg.first < l.segments[0].first
@@ -330,6 +328,13 @@ func (l *Log) verify(seg *segment) error {
 	}
 
 	if err != nil {
+		return wrap(err)
+	}
+
+	found, err := seg.scanTrusted(file)
+	if err != nil {
+		_ = file.Close() // read only, nothing to lose
+
 		return err
 	}
 
@@ -337,7 +342,16 @@ func (l *Log) verify(seg *segment) error {
 	seg.sparseIndex = append(found.entries, seg.sparseIndex...)
 	seg.readableEnd, seg.lost = found.end, found.lost
 	seg.verified = true
+
+	// A closed segment still in the log keeps the file as its reader. Reclaim
+	// and Close take mu before closing readers, so they will close this one.
+	kept := seg.file == nil && !l.closed && seg.first >= l.segments[0].first &&
+		seg.reader.CompareAndSwap(nil, file)
 	l.mu.Unlock()
+
+	if !kept {
+		_ = file.Close() // read only, nothing to lose
+	}
 
 	return nil
 }
@@ -515,6 +529,7 @@ func (l *Log) load() error {
 	return nil
 }
 
+// active returns the segment taking appends, or nil before load.
 func (l *Log) active() *segment {
 	if len(l.segments) == 0 {
 		return nil
@@ -535,6 +550,7 @@ func (l *Log) segmentFor(index uint64) int {
 	return i
 }
 
+// checkWritable returns why the log refuses mutations, if it does.
 func (l *Log) checkWritable() error {
 	if l.closed {
 		return ErrClosed
@@ -688,6 +704,8 @@ func (l *Log) flush(pending []*appendRequest, buf []byte) {
 	}
 }
 
+// writeActive writes buf at the end of the active segment and syncs it when
+// SyncOnAppend is set.
 func (l *Log) writeActive(buf []byte) error {
 	tail := l.active()
 
@@ -747,6 +765,11 @@ func (l *Log) reclaim() error {
 	l.segments = slices.Delete(l.segments, 0, n)
 	l.mu.Unlock()
 
+	// Reads find segments only under mu, so none can use these readers now.
+	for _, seg := range l.doomed {
+		seg.closeReader()
+	}
+
 	var (
 		removed int
 		freed   int64
@@ -771,6 +794,7 @@ func (l *Log) reclaim() error {
 	return err
 }
 
+// syncActive makes the active segment durable unless it already is.
 func (l *Log) syncActive() error {
 	tail := l.active()
 	if l.synced == tail.nextIndex() {
@@ -807,10 +831,14 @@ func (l *Log) saveCheckpoint(cp checkpoint) error {
 	return nil
 }
 
-// release closes the active segment without syncing it and unlocks the
-// directory.
+// release closes the active segment without syncing it, closes the readers
+// and unlocks the directory.
 func (l *Log) release() error {
 	var err error
+
+	for _, seg := range l.segments {
+		seg.closeReader()
+	}
 
 	if tail := l.active(); tail != nil {
 		err = tail.close()
@@ -819,6 +847,7 @@ func (l *Log) release() error {
 	return errors.Join(err, l.lock.Close())
 }
 
+// startSyncer starts the background sync when SyncInterval is set.
 func (l *Log) startSyncer() {
 	if l.cfg.SyncInterval == 0 {
 		return
@@ -850,6 +879,7 @@ func (l *Log) runSyncer() {
 	}
 }
 
+// stopSyncer stops the background sync and waits for it to exit.
 func (l *Log) stopSyncer() {
 	if l.syncStop == nil {
 		return

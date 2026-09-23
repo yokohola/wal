@@ -134,6 +134,84 @@ func TestRecordReader_CrossesChunks(t *testing.T) {
 	require.Equal(t, int64(len(buf)), reader.offset)
 }
 
+// fetchLog records the length of every ReadAt.
+type fetchLog struct {
+	src     io.ReaderAt
+	fetches []int
+}
+
+func (f *fetchLog) ReadAt(p []byte, off int64) (int, error) {
+	f.fetches = append(f.fetches, len(p))
+
+	return f.src.ReadAt(p, off)
+}
+
+func TestRecordReader_FetchesUpToStop(t *testing.T) {
+	t.Parallel()
+
+	var buf []byte
+	for i := range uint64(4) {
+		buf = appendRecord(buf, i+1, []byte("data"))
+	}
+
+	stop := int64(2 * (recordHeaderSize + len("data")))
+	src := &fetchLog{src: bytes.NewReader(buf)}
+	reader := recordReader{src: src, end: int64(len(buf)), stop: stop}
+
+	for index := uint64(1); index <= 2; index++ {
+		data, err := reader.next(index)
+		require.NoError(t, err)
+		require.Equal(t, []byte("data"), data)
+	}
+
+	require.Equal(t, []int{int(stop)}, src.fetches)
+
+	// Past stop, each fetch takes only what the record needs.
+	data, err := reader.next(3)
+	require.NoError(t, err)
+	require.Equal(t, []byte("data"), data)
+	require.Equal(t, []int{int(stop), recordHeaderSize, recordHeaderSize + len("data")}, src.fetches)
+}
+
+func TestRecordReader_RecordRunsPastStop(t *testing.T) {
+	t.Parallel()
+
+	large := bytes.Repeat([]byte("x"), readChunkSize+5)
+	buf := appendRecord(nil, 1, []byte("a"))
+	buf = appendRecord(buf, 2, large)
+	buf = appendRecord(buf, 3, []byte("b"))
+
+	// stop falls inside record 2: the record is still read whole, in one fetch.
+	stop := int64(recordHeaderSize + 1 + recordHeaderSize + 100)
+	src := &fetchLog{src: bytes.NewReader(buf)}
+	reader := recordReader{src: src, end: int64(len(buf)), stop: stop}
+
+	for index, want := range [][]byte{[]byte("a"), large, []byte("b")} {
+		data, err := reader.next(uint64(index + 1))
+		require.NoError(t, err)
+		require.Equal(t, want, data)
+	}
+
+	require.Equal(t, []int{int(stop), recordHeaderSize + len(large), recordHeaderSize, recordHeaderSize + 1}, src.fetches)
+}
+
+func TestRecordReader_StopDoesNotHideShortRecord(t *testing.T) {
+	t.Parallel()
+
+	buf := appendRecord(nil, 1, []byte("payload"))
+
+	// A stop before the record's end neither shortens the fetch nor fakes a
+	// short record; end alone decides that.
+	reader := recordReader{src: bytes.NewReader(buf), end: int64(len(buf)), stop: recordHeaderSize}
+	data, err := reader.next(1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), data)
+
+	reader = recordReader{src: bytes.NewReader(buf), end: int64(len(buf)) - 1, stop: recordHeaderSize}
+	_, err = reader.next(1)
+	require.ErrorIs(t, err, errShortRecord)
+}
+
 func TestRecordReader_StopsAtFailingRecord(t *testing.T) {
 	t.Parallel()
 

@@ -8,11 +8,9 @@ import (
 	"math"
 )
 
-// A record is a 12-byte header and its data. The header holds the data length,
-// a CRC32C of the record's index and data and a CRC32C of those first 8 bytes,
-// so a damaged length is caught before it is trusted. The index is not stored:
-// it follows from the record's position, and a record found at another position
-// fails its data checksum. Zero bytes never form a valid header.
+// A record is a 12-byte header (data length, CRC32C of index and data, CRC32C
+// of those 8 bytes) and the data. The index is not stored, so a record at the
+// wrong position fails its checksum.
 const (
 	recordHeaderSize   = 12
 	formatMaxRecordLen = math.MaxUint32
@@ -33,12 +31,14 @@ var (
 	indexCRCTable = makeIndexCRCTable()
 )
 
-// recordReader decodes consecutive records from src between offset and end.
-// Every fetch allocates a new chunk, so returned data stays valid.
+// recordReader decodes consecutive records from src between offset and end,
+// fetching at most readChunkSize bytes and not past stop. Every fetch allocates
+// a new chunk, so returned data stays valid.
 type recordReader struct {
 	src    io.ReaderAt
 	offset int64 // file offset of chunk[0]
 	end    int64
+	stop   int64 // where the wanted records end; zero means end
 	chunk  []byte
 }
 
@@ -97,6 +97,7 @@ func (r *recordReader) locate() (int64, error) {
 	return size, nil
 }
 
+// advance moves past a buffered record of size bytes.
 func (r *recordReader) advance(size int64) {
 	r.chunk = r.chunk[size:]
 	r.offset += size
@@ -113,7 +114,12 @@ func (r *recordReader) fill(n int64) error {
 		return errShortRecord
 	}
 
-	chunk := make([]byte, min(max(n, readChunkSize), r.end-r.offset))
+	size := int64(readChunkSize)
+	if r.stop > 0 {
+		size = min(size, r.stop-r.offset)
+	}
+
+	chunk := make([]byte, min(max(n, size), r.end-r.offset))
 
 	read, err := r.src.ReadAt(chunk, r.offset)
 	if read < len(chunk) {

@@ -14,6 +14,7 @@ import (
 // leaves whole sectors unwritten, and those read back as zeros.
 const sectorSize = 512
 
+// zeroSector is compared against to spot unwritten sectors.
 var zeroSector [sectorSize]byte
 
 // listSegments returns the first indexes of the segments in dir, ascending. It
@@ -148,6 +149,8 @@ func recoverActiveSegment(
 	return seg, nil
 }
 
+// repairActiveSegment scans the active segment past the checkpoint, truncates a
+// torn tail, syncs and preallocates the file.
 func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc int64) error {
 	info, err := file.Stat()
 	if err != nil {

@@ -65,6 +65,7 @@ func readCheckpoint(dir string) (checkpoint, bool, error) {
 	return cp, true, nil
 }
 
+// writeCheckpoint durably replaces the checkpoint with cp.
 func writeCheckpoint(dir string, cp checkpoint) error {
 	var buf [checkpointSize]byte
 

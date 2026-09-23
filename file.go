@@ -39,6 +39,7 @@ func writeFileAtomic(path string, data []byte) error {
 	return syncDir(filepath.Dir(path))
 }
 
+// syncDir makes the entries of dir, such as renames, durable.
 func syncDir(dir string) error {
 	handle, err := os.Open(dir)
 	if err != nil {

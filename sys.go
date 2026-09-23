@@ -8,6 +8,7 @@ import (
 	"syscall"
 )
 
+// lockName is the file flock holds to keep other processes out.
 const lockName = "LOCK"
 
 // lockDir takes an exclusive flock on the lock file in dir. The lock lasts

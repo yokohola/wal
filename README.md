@@ -105,7 +105,7 @@ Segment roll, `Commit`, `Close` and `Sync` always fsync.
   `SyncOnAppend`. A power loss can lose the last interval; a process crash
   cannot.
 - **Reads:** read in batches (`Read(next, 1024)`). A 128-record read costs
-  about the same as a single-record read.
+  about six single-record reads.
 - **Disk:** set `MaxWALSize` and treat `ErrFull` as backpressure.
 
 ## Performance
@@ -118,8 +118,8 @@ three runs; reads use a warmed 100,000-record dataset.
 | Single append, no sync | 1.43 µs | 1.40 µs | 1.39 µs | n/a |
 | Single durable append | 2.58 ms | 2.61 ms | 2.65 ms | 1.70 ms |
 | Durable appends, 16 writers | **2,993 rec/s** | 368 rec/s | 331 rec/s | 484 rec/s |
-| Random single-record read | 22.8 µs | 0.098 µs | 1.74 µs | 3.35 µs |
-| Sequential read, 128 records | 24.0 µs | 3.52 µs | 111 µs | 231 µs |
+| Random single-record read | 1.45 µs | 0.098 µs | 1.74 µs | 3.35 µs |
+| Sequential read, 128 records | 9.22 µs | 3.52 µs | 111 µs | 231 µs |
 
 Group commit gives 6 to 9× the durable throughput with concurrent writers.
 tidwall serves reads from an in-memory cache without checksum validation;
