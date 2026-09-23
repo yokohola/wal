@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -210,18 +211,20 @@ func TestCheckpoint_RoundTrip(t *testing.T) {
 
 	dir := t.TempDir()
 
-	index, found, err := readCheckpoint(dir)
+	cp, found, err := readCheckpoint(dir)
 	require.NoError(t, err)
 	require.False(t, found)
-	require.Zero(t, index)
+	require.Zero(t, cp)
 
-	require.NoError(t, writeCheckpoint(dir, 42))
-	require.NoError(t, writeCheckpoint(dir, 43))
+	want := checkpoint{committed: 43, segment: 40, end: 1 << 40, next: math.MaxUint64}
 
-	index, found, err = readCheckpoint(dir)
+	require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 42}))
+	require.NoError(t, writeCheckpoint(dir, want))
+
+	cp, found, err = readCheckpoint(dir)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Equal(t, uint64(43), index)
+	require.Equal(t, want, cp)
 	require.NoFileExists(t, filepath.Join(dir, checkpointName+tempExt))
 }
 
@@ -248,7 +251,7 @@ func TestCheckpoint_RejectsDamage(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			require.NoError(t, writeCheckpoint(dir, 7))
+			require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 7}))
 			damage(t, filepath.Join(dir, checkpointName))
 
 			_, _, err := readCheckpoint(dir)

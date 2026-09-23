@@ -12,8 +12,8 @@ import (
 // a CRC32C of the data and a CRC32C of those first 8 bytes, so a damaged length
 // is caught before it is trusted. Zero bytes never form a valid header.
 const (
-	recordHeaderSize = 12
-	maxRecordSize    = math.MaxUint32
+	recordHeaderSize   = 12
+	formatMaxRecordLen = math.MaxUint32
 
 	// readChunkSize is how many bytes a recordReader fetches at a time.
 	readChunkSize = 256 << 10
@@ -97,7 +97,7 @@ func (r *recordReader) fill(n int64) error {
 }
 
 // appendRecord frames data and appends it to dst. The caller ensures that
-// len(data) <= maxRecordSize.
+// len(data) <= formatMaxRecordLen.
 func appendRecord(dst, data []byte) []byte {
 	start := len(dst)
 

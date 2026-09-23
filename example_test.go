@@ -35,7 +35,7 @@ func Example() {
 }
 
 func consume(ctx context.Context, l *wal.Log) error {
-	for next := l.Committed(); ctx.Err() == nil; {
+	for next := l.Committed() + 1; ctx.Err() == nil; {
 		recs, err := l.Read(next, 1024)
 		if err != nil {
 			return err
@@ -51,9 +51,10 @@ func consume(ctx context.Context, l *wal.Log) error {
 			log.Printf("apply %d: %s", rec.Index, rec.Data)
 		}
 
-		next = recs[len(recs)-1].Index + 1
+		last := recs[len(recs)-1].Index
+		next = last + 1
 
-		if err := l.Commit(next); err != nil {
+		if err := l.Commit(last); err != nil {
 			return err
 		}
 	}

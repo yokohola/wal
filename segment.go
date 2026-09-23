@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // A segment file is a 16-byte header followed by records. The header holds a
@@ -41,14 +42,57 @@ type segment struct {
 	size        int64        // header and records; preallocation makes the file longer
 	sparseIndex []indexEntry // one entry per sparseInterval bytes or so
 	file        *os.File     // open while the segment is active
+
+	// Open trusts the bytes up to trustedEnd to hold the records below
+	// trustedNext without reading them. The first read verifies and indexes
+	// them; until then sparseIndex covers only what follows.
+	trustedEnd  int64
+	trustedNext uint64
+	verified    bool
+	verifyMu    sync.Mutex // serializes verification and guards corrupt
+	corrupt     error      // damage verification found
 }
 
 func newSegment(dir string, first uint64) *segment {
 	return &segment{
-		first: first,
-		path:  filepath.Join(dir, segmentName(first)),
-		size:  segmentHeaderSize,
+		first:    first,
+		path:     filepath.Join(dir, segmentName(first)),
+		size:     segmentHeaderSize,
+		verified: true,
 	}
+}
+
+// trust accepts the bytes up to end as the records below next, unread.
+func (s *segment) trust(end int64, next uint64) {
+	s.size, s.count = end, next-s.first
+	s.trustedEnd, s.trustedNext = end, next
+	s.verified = false
+}
+
+// scanTrusted reads the trusted bytes, checking the header, every record and
+// that they hold exactly the trusted records, and returns their index entries.
+func (s *segment) scanTrusted() ([]indexEntry, error) {
+	file, err := os.Open(s.path)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	defer func() { _ = file.Close() }() // read only, nothing to lose
+
+	if err := s.checkHeader(file); err != nil {
+		return nil, err
+	}
+
+	prefix := newSegment(filepath.Dir(s.path), s.first)
+	if err := prefix.scan(file, s.trustedEnd); err != nil {
+		return nil, s.recordError(prefix.size, err)
+	}
+
+	if prefix.nextIndex() != s.trustedNext {
+		return nil, fmt.Errorf("%w: %s ends at index %d but should end at %d",
+			ErrCorrupt, s.path, prefix.nextIndex()-1, s.trustedNext-1)
+	}
+
+	return prefix.sparseIndex, nil
 }
 
 // createSegment makes an empty segment through a temp file and a rename, so a
@@ -111,7 +155,8 @@ func (s *segment) position(index uint64) (uint64, int64) {
 }
 
 // read appends records with index >= from to out until out holds limit records
-// or the segment ends.
+// or the segment ends. The segment must be verified. Callers hold the log's
+// read lock, so nothing is published meanwhile.
 func (s *segment) read(from uint64, limit int, out []Record) ([]Record, error) {
 	file := s.file
 	if file == nil {

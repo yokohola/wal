@@ -18,14 +18,15 @@ var zeroSector [sectorSize]byte
 
 // load rebuilds the log from its directory. It deletes temp files and committed
 // segments a crash left behind and cuts a torn tail off the active segment. Any
-// other inconsistency is ErrCorrupt.
-func (l *Log) load() error {
+// other inconsistency it reads is ErrCorrupt. Only what follows the checkpoint
+// is read; the rest is verified by the first read that touches it.
+func (l *Log) load() error { // todo: log point in different file, needed poolishing and refactoring for the whole project
 	firsts, err := listSegments(l.dir)
 	if err != nil {
 		return err
 	}
 
-	checkpoint, found, err := readCheckpoint(l.dir)
+	cp, found, err := readCheckpoint(l.dir)
 	if err != nil {
 		return err
 	}
@@ -34,24 +35,20 @@ func (l *Log) load() error {
 
 	switch {
 	case len(firsts) == 0 && found:
-		return fmt.Errorf("%w: checkpoint %d but no segments", ErrCorrupt, checkpoint)
+		return fmt.Errorf("%w: checkpoint %d but no segments", ErrCorrupt, cp.committed)
 	case len(firsts) == 0:
 		seg, err := createSegment(l.dir, 1, l.cfg.SegmentSize)
 		if err != nil {
 			return err
 		}
 
-		segments, checkpoint = []*segment{seg}, 1
+		segments = []*segment{seg}
 	default:
 		if !found && firsts[0] != 1 {
 			return fmt.Errorf("%w: no checkpoint but the first segment starts at %d", ErrCorrupt, firsts[0])
 		}
 
-		if !found {
-			checkpoint = 1
-		}
-
-		segments, err = loadSegments(l.dir, firsts, checkpoint, l.cfg.SegmentSize)
+		segments, err = loadSegments(l.dir, firsts, cp, l.cfg.SegmentSize)
 		if err != nil {
 			return err
 		}
@@ -59,8 +56,9 @@ func (l *Log) load() error {
 
 	// Recovery synced the active segment, so every record found is durable.
 	l.segments = segments
-	l.committed = checkpoint
-	l.synced = l.active().nextIndex()
+	l.committed = cp.committed
+	l.saved = cp
+	l.markSynced()
 
 	for _, seg := range segments {
 		l.size += seg.size
@@ -102,28 +100,35 @@ func listSegments(dir string) ([]uint64, error) {
 }
 
 // loadSegments validates the segments named by firsts against the checkpoint
-// and opens the last one for appending. Segments wholly below the checkpoint
+// and opens the last one for appending. Segments holding only committed records
 // are skipped and deleted once the rest is valid: a crash after the checkpoint
 // is written can leave any of them, so gaps there are no damage.
-func loadSegments(dir string, firsts []uint64, checkpoint uint64, prealloc int64) ([]*segment, error) {
+func loadSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([]*segment, error) {
 	live := firsts
-	for len(live) > 1 && live[1] <= checkpoint {
+	for len(live) > 1 && live[1] <= cp.committed+1 {
 		live = live[1:]
 	}
 
-	if checkpoint < live[0] {
-		return nil, fmt.Errorf("%w: checkpoint %d is below the first segment %d", ErrCorrupt, checkpoint, live[0])
+	if cp.committed+1 < live[0] {
+		return nil, fmt.Errorf("%w: checkpoint %d but the first segment starts at %d",
+			ErrCorrupt,
+			cp.committed,
+			live[0])
 	}
 
-	segments, err := openSegments(dir, live, prealloc)
+	if cp.segment >= live[0] && !slices.Contains(live, cp.segment) {
+		return nil, fmt.Errorf("%w: checkpoint names segment %d, which is missing", ErrCorrupt, cp.segment)
+	}
+
+	segments, err := openSegments(dir, live, cp, prealloc)
 	if err != nil {
 		return nil, err
 	}
 
 	active := segments[len(segments)-1]
-	if checkpoint > active.nextIndex() {
+	if cp.committed >= active.nextIndex() {
 		return nil, errors.Join(
-			fmt.Errorf("%w: checkpoint %d is past the last record %d", ErrCorrupt, checkpoint, active.nextIndex()-1),
+			fmt.Errorf("%w: checkpoint %d is past the last record %d", ErrCorrupt, cp.committed, active.nextIndex()-1),
 			active.close())
 	}
 
@@ -136,26 +141,21 @@ func loadSegments(dir string, firsts []uint64, checkpoint uint64, prealloc int64
 	return segments, nil
 }
 
-// openSegments validates contiguous segments and opens the last for appending.
-func openSegments(dir string, firsts []uint64, prealloc int64) ([]*segment, error) {
+// openSegments loads contiguous segments and opens the last for appending.
+func openSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([]*segment, error) {
 	last := len(firsts) - 1
 	segments := make([]*segment, 0, len(firsts))
 
 	for i, first := range firsts[:last] {
-		seg, err := loadClosedSegment(dir, first)
+		seg, err := trustClosedSegment(dir, first, firsts[i+1])
 		if err != nil {
 			return nil, err
-		}
-
-		if seg.nextIndex() != firsts[i+1] {
-			return nil, fmt.Errorf("%w: %s ends at index %d but the next segment starts at %d",
-				ErrCorrupt, seg.path, seg.nextIndex()-1, firsts[i+1])
 		}
 
 		segments = append(segments, seg)
 	}
 
-	active, err := recoverActiveSegment(dir, firsts[last], prealloc)
+	active, err := recoverActiveSegment(dir, firsts[last], cp, prealloc)
 	if err != nil {
 		return nil, err
 	}
@@ -163,37 +163,27 @@ func openSegments(dir string, firsts []uint64, prealloc int64) ([]*segment, erro
 	return append(segments, active), nil
 }
 
-// loadClosedSegment reads a segment that was sealed before the next one was
-// created, so every byte up to its end must be an intact record.
-func loadClosedSegment(dir string, first uint64) (*segment, error) {
+// trustClosedSegment accepts a segment unread. It was sealed before the next
+// one was created, so a crash cannot have torn it, and its records end where
+// the next segment starts.
+func trustClosedSegment(dir string, first, next uint64) (*segment, error) {
 	seg := newSegment(dir, first)
 
-	file, err := os.Open(seg.path)
-	if err != nil {
-		return nil, wrap(err)
-	}
-	defer func() { _ = file.Close() }() // read only, nothing to lose
-
-	info, err := file.Stat()
+	info, err := os.Stat(seg.path)
 	if err != nil {
 		return nil, wrap(err)
 	}
 
-	if err := seg.checkHeader(file); err != nil {
-		return nil, err
-	}
-
-	if err := seg.scan(file, info.Size()); err != nil {
-		return nil, seg.recordError(seg.size, err)
-	}
+	seg.trust(info.Size(), next)
 
 	return seg, nil
 }
 
-// recoverActiveSegment opens the last segment for appending. A torn tail is
-// truncated and the file synced before any append, so new records never land
-// in front of stale bytes that a later crash could expose.
-func recoverActiveSegment(dir string, first uint64, prealloc int64) (*segment, error) {
+// recoverActiveSegment opens the last segment for appending. It trusts what the
+// checkpoint marks durable and scans the rest. A torn tail is truncated and the
+// file synced before any append, so new records never land in front of stale
+// bytes that a later crash could expose.
+func recoverActiveSegment(dir string, first uint64, cp checkpoint, prealloc int64) (*segment, error) {
 	seg := newSegment(dir, first)
 
 	file, err := os.OpenFile(seg.path, os.O_RDWR, 0)
@@ -201,7 +191,7 @@ func recoverActiveSegment(dir string, first uint64, prealloc int64) (*segment, e
 		return nil, wrap(err)
 	}
 
-	if err := repairActiveSegment(seg, file, prealloc); err != nil {
+	if err := repairActiveSegment(seg, file, cp, prealloc); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
 
@@ -210,7 +200,7 @@ func recoverActiveSegment(dir string, first uint64, prealloc int64) (*segment, e
 	return seg, nil
 }
 
-func repairActiveSegment(seg *segment, file *os.File, prealloc int64) error {
+func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc int64) error {
 	info, err := file.Stat()
 	if err != nil {
 		return wrap(err)
@@ -218,6 +208,18 @@ func repairActiveSegment(seg *segment, file *os.File, prealloc int64) error {
 
 	if err := seg.checkHeader(file); err != nil {
 		return err
+	}
+
+	if cp.segment == seg.first {
+		empty := cp.end == segmentHeaderSize
+		if cp.end < segmentHeaderSize || cp.end > info.Size() || cp.next < seg.first ||
+			cp.next <= cp.committed || empty != (cp.next == seg.first) ||
+			cp.next-seg.first > uint64(cp.end-segmentHeaderSize)/recordHeaderSize {
+			return fmt.Errorf("%w: checkpoint end %d at index %d, committed %d, does not fit %s of %d bytes",
+				ErrCorrupt, cp.end, cp.next, cp.committed, seg.path, info.Size())
+		}
+
+		seg.trust(cp.end, cp.next)
 	}
 
 	if scanErr := seg.scan(file, info.Size()); scanErr != nil {

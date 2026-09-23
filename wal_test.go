@@ -30,7 +30,7 @@ func TestOpen_FreshDirectory(t *testing.T) {
 
 	require.Equal(t, uint64(1), l.FirstIndex())
 	require.Equal(t, uint64(0), l.LastIndex())
-	require.Equal(t, uint64(1), l.Committed())
+	require.Equal(t, uint64(0), l.Committed())
 	require.Equal(t, int64(segmentHeaderSize), l.Size())
 	require.Equal(t, []string{segmentName(1)}, segmentFiles(t, dir))
 }
@@ -41,6 +41,8 @@ func TestOpen_RejectsInvalidConfig(t *testing.T) {
 	cases := map[string]Config{
 		"negative segment size":       {SegmentSize: -1},
 		"negative max size":           {MaxSize: -1},
+		"negative max record size":    {MaxRecordSize: -1},
+		"record size above format":    {MaxRecordSize: math.MaxUint32 + 1},
 		"negative sync interval":      {SyncInterval: -time.Second},
 		"max size below segment size": {SegmentSize: 1024, MaxSize: 1023},
 		"max size below default":      {MaxSize: DefaultSegmentSize - 1},
@@ -189,6 +191,40 @@ func TestAppend_RejectsBatchThatNeverFits(t *testing.T) {
 
 	appendN(t, l, 1)
 	requireRecords(t, readAll(t, l), 1, 5)
+}
+
+func TestAppend_BoundsRecordSize(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	l := openLog(t, dir, Config{MaxRecordSize: 100})
+
+	_, err := l.Append(make([]byte, 100))
+	require.NoError(t, err)
+
+	_, err = l.Append(payload(2), make([]byte, 101))
+	require.ErrorIs(t, err, ErrTooLarge)
+	require.Equal(t, uint64(1), l.LastIndex(), "no record of a rejected batch is written")
+	require.Equal(t, segmentHeaderSize+recordHeaderSize+int64(100), l.Size())
+	require.NoError(t, l.Close())
+
+	l = openLog(t, dir, Config{MaxRecordSize: 10})
+
+	recs, err := l.Read(1, 1)
+	require.NoError(t, err)
+	require.Len(t, recs[0].Data, 100, "a lower limit keeps existing records readable")
+}
+
+func TestAppend_DefaultMaxRecordSize(t *testing.T) {
+	t.Parallel()
+
+	l := openLog(t, t.TempDir(), Config{})
+
+	_, err := l.Append(make([]byte, DefaultMaxRecordSize))
+	require.NoError(t, err)
+
+	_, err = l.Append(make([]byte, DefaultMaxRecordSize+1))
+	require.ErrorIs(t, err, ErrTooLarge)
 }
 
 func TestRead_Ranges(t *testing.T) {
@@ -365,20 +401,24 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{SegmentSize: segmentOf(4)}
 	l := openLog(t, dir, cfg)
+
+	require.NoError(t, l.Commit(0), "nothing to commit")
+	require.ErrorIs(t, l.Commit(1), ErrOutOfRange)
+
 	appendN(t, l, 10)
 
-	require.NoError(t, l.Commit(6))
-	require.Equal(t, uint64(6), l.Committed())
+	require.NoError(t, l.Commit(5))
+	require.Equal(t, uint64(5), l.Committed())
 	require.Equal(t, uint64(5), l.FirstIndex())
 	require.Equal(t, []string{segmentName(5), segmentName(9)}, segmentFiles(t, dir))
 	require.Equal(t, 2*segmentHeaderSize+6*int64(testRecordSize), l.Size())
 
 	require.NoError(t, l.Commit(3), "a lower index is a no-op")
-	require.Equal(t, uint64(6), l.Committed())
+	require.Equal(t, uint64(5), l.Committed())
 
-	require.ErrorIs(t, l.Commit(12), ErrOutOfRange)
+	require.ErrorIs(t, l.Commit(11), ErrOutOfRange)
 
-	require.NoError(t, l.Commit(11))
+	require.NoError(t, l.Commit(10))
 	require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir), "the active segment stays")
 	require.Equal(t, uint64(9), l.FirstIndex())
 	require.Equal(t, uint64(10), l.LastIndex())
@@ -386,7 +426,7 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 	require.NoError(t, l.Close())
 
 	l = openLog(t, dir, cfg)
-	require.Equal(t, uint64(11), l.Committed())
+	require.Equal(t, uint64(10), l.Committed())
 	require.Equal(t, uint64(9), l.FirstIndex())
 	require.Equal(t, uint64(10), l.LastIndex())
 }
@@ -400,24 +440,24 @@ func TestCommit_SyncsRecordsBeforeCheckpoint(t *testing.T) {
 	var seen []uint64
 
 	l := openLogWith(t, dir, Config{}, func(file *os.File) error {
-		index, _, err := readCheckpoint(dir)
+		cp, _, err := readCheckpoint(dir)
 		require.NoError(t, err)
 
-		seen = append(seen, index)
+		seen = append(seen, cp.committed)
 
 		return file.Sync()
 	})
 
 	appendN(t, l, 3)
-	require.NoError(t, l.Commit(3))
+	require.NoError(t, l.Commit(2))
 	require.Equal(t, []uint64{0}, seen, "records were synced before the first checkpoint")
 
-	require.NoError(t, l.Commit(4))
+	require.NoError(t, l.Commit(3))
 	require.Len(t, seen, 1, "records already durable are not synced again")
 
 	appendN(t, l, 1)
-	require.NoError(t, l.Commit(5))
-	require.Equal(t, []uint64{0, 4}, seen)
+	require.NoError(t, l.Commit(4))
+	require.Equal(t, []uint64{0, 3}, seen)
 }
 
 func TestCommit_RetryFinishesReclaim(t *testing.T) {
@@ -433,13 +473,18 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 	require.NoError(t, os.Mkdir(blocked, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(blocked, "file"), nil, 0o644))
 
-	require.Error(t, l.Commit(9))
-	require.Equal(t, uint64(9), l.Committed(), "the checkpoint is durable")
-	require.Equal(t, uint64(1), l.FirstIndex())
+	size := l.Size()
+
+	require.Error(t, l.Commit(8))
+	require.Equal(t, uint64(8), l.Committed(), "the checkpoint is durable")
+	require.Equal(t, uint64(9), l.FirstIndex(), "reclaimed segments leave the log at once")
+	require.Equal(t, size, l.Size(), "undeleted files still count")
+	require.FileExists(t, filepath.Join(dir, segmentName(5)))
+	requireRecords(t, readAll(t, l), 9, 2)
 
 	require.NoError(t, os.Remove(filepath.Join(blocked, "file")))
 
-	require.NoError(t, l.Commit(9))
+	require.NoError(t, l.Commit(8))
 	require.Equal(t, uint64(9), l.FirstIndex())
 	require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
 	require.Equal(t, segmentHeaderSize+2*int64(testRecordSize), l.Size())
@@ -455,7 +500,7 @@ func TestMaxSize_AppliesBackpressure(t *testing.T) {
 	require.ErrorIs(t, err, ErrFull)
 	require.Equal(t, uint64(7), l.LastIndex(), "nothing is written on ErrFull")
 
-	require.NoError(t, l.Commit(5))
+	require.NoError(t, l.Commit(4))
 	appendN(t, l, 2)
 	requireRecords(t, readAll(t, l), 5, 5)
 }
@@ -477,11 +522,11 @@ func TestMaxSize_RollsAwayCommittedActiveSegment(t *testing.T) {
 
 	next := [][]byte{payload(9), payload(10), payload(11), payload(12)}
 
-	require.NoError(t, l.Commit(5))
+	require.NoError(t, l.Commit(4))
 	_, err = l.Append(next...)
 	require.ErrorIs(t, err, ErrFull, "uncommitted records keep the segment")
 
-	require.NoError(t, l.Commit(9))
+	require.NoError(t, l.Commit(8))
 	_, err = l.Append(next...)
 	require.NoError(t, err)
 
@@ -504,6 +549,132 @@ func TestSync_OnAppend(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, l.Sync())
 	require.Equal(t, int64(3), calls.Load(), "nothing left to sync")
+}
+
+func TestSync_ConcurrentAppendsShareOneFsync(t *testing.T) {
+	t.Parallel()
+
+	const queued = 10
+
+	var (
+		calls    atomic.Int64
+		blocking atomic.Bool
+	)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	dir := t.TempDir()
+	l := openLogWith(t, dir, Config{SyncOnAppend: true}, func(file *os.File) error {
+		calls.Add(1)
+
+		if blocking.CompareAndSwap(true, false) {
+			close(entered)
+			<-release
+		}
+
+		return file.Sync()
+	})
+
+	blocking.Store(true)
+
+	var wg sync.WaitGroup
+
+	lasts := make(chan uint64, queued+1)
+	appendOne := func(data []byte) {
+		last, err := l.Append(data)
+		if err != nil {
+			t.Error(err)
+
+			return
+		}
+
+		lasts <- last
+	}
+
+	wg.Go(func() { appendOne(payload(0)) })
+	<-entered
+
+	for i := range queued {
+		wg.Go(func() { appendOne(payload(uint64(i + 1))) })
+	}
+
+	require.Eventually(t, func() bool {
+		l.queueMu.Lock()
+		defer l.queueMu.Unlock()
+
+		return len(l.queue) == queued
+	}, 5*time.Second, time.Millisecond)
+
+	require.Equal(t, uint64(0), l.LastIndex(), "records are invisible until their fsync")
+
+	close(release)
+	wg.Wait()
+	close(lasts)
+
+	require.Equal(t, int64(2), calls.Load(), "the queued appends share one fsync")
+
+	seen := map[uint64]bool{}
+	for last := range lasts {
+		seen[last] = true
+	}
+
+	require.Len(t, seen, queued+1)
+	require.Equal(t, uint64(queued+1), l.LastIndex())
+	require.NoError(t, l.Close())
+
+	l = openLog(t, dir, Config{})
+	recs := readAll(t, l)
+	require.Len(t, recs, queued+1)
+
+	for _, rec := range recs {
+		require.True(t, seen[rec.Index])
+	}
+}
+
+func TestAppend_GroupKeepsPerBatchOutcome(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(2), MaxSize: 2 * segmentOf(2)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 1)
+
+	request := func(data ...[]byte) *appendRequest {
+		return &appendRequest{data: data, size: int64(len(data)) * testRecordSize, done: make(chan struct{})}
+	}
+
+	fits := request(payload(2))
+	rolls := request(payload(3))
+	full := request(payload(0), payload(0))
+	fitsAfter := request(payload(4))
+
+	l.writeMu.Lock()
+	l.writeGroup([]*appendRequest{fits, rolls, full, fitsAfter})
+	l.writeMu.Unlock()
+
+	for _, req := range []*appendRequest{fits, rolls, full, fitsAfter} {
+		select {
+		case <-req.done:
+		default:
+			t.Fatal("request not completed")
+		}
+	}
+
+	require.NoError(t, fits.err)
+	require.Equal(t, uint64(2), fits.last)
+	require.NoError(t, rolls.err)
+	require.Equal(t, uint64(3), rolls.last)
+	require.ErrorIs(t, full.err, ErrFull)
+	require.NoError(t, fitsAfter.err)
+	require.Equal(t, uint64(4), fitsAfter.last)
+
+	require.Equal(t, []string{segmentName(1), segmentName(3)}, segmentFiles(t, dir))
+	requireRecords(t, readAll(t, l), 1, 4)
+	require.NoError(t, l.Close())
+
+	l = openLog(t, dir, cfg)
+	requireRecords(t, readAll(t, l), 1, 4)
 }
 
 func TestSync_OnDemand(t *testing.T) {
@@ -563,7 +734,7 @@ func TestClose_RejectsFurtherUse(t *testing.T) {
 
 	require.Equal(t, uint64(1), l.FirstIndex())
 	require.Equal(t, uint64(2), l.LastIndex())
-	require.Equal(t, uint64(1), l.Committed())
+	require.Equal(t, uint64(0), l.Committed())
 }
 
 func TestFailure_IsSticky(t *testing.T) {
@@ -640,8 +811,8 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 
 	seen := make(map[int]int, writers)
 	deadline := time.Now().Add(30 * time.Second)
-	from := l.Committed()
-	committed := from
+	committed := l.Committed()
+	from := committed + 1
 
 	for count := 0; count < total; {
 		require.True(t, time.Now().Before(deadline), "read %d of %d records before the deadline", count, total)
@@ -668,18 +839,18 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 		count += len(recs)
 		from = recs[len(recs)-1].Index + 1
 
-		if from-committed >= 256 {
-			require.NoError(t, l.Commit(from))
+		if last := from - 1; last-committed >= 256 {
+			require.NoError(t, l.Commit(last))
 
-			committed = from
+			committed = last
 		}
 	}
 
 	wg.Wait()
 
-	require.NoError(t, l.Commit(from))
+	require.NoError(t, l.Commit(from-1))
 
-	require.Equal(t, uint64(total+1), l.Committed())
+	require.Equal(t, uint64(total), l.Committed())
 	require.Equal(t, uint64(total), l.LastIndex())
 	require.Less(t, l.Size(), int64(2*4096), "committed segments were reclaimed")
 }
@@ -687,7 +858,7 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 func BenchmarkAppend(b *testing.B) {
 	for _, batch := range []int{1, 100} {
 		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) {
-			l := openBench(b)
+			l := openBench(b, Config{})
 
 			data := make([][]byte, batch)
 			for i := range data {
@@ -706,10 +877,27 @@ func BenchmarkAppend(b *testing.B) {
 	}
 }
 
+func BenchmarkAppend_ConcurrentSync(b *testing.B) {
+	l := openBench(b, Config{SyncOnAppend: true})
+	data := make([]byte, 160)
+
+	b.SetParallelism(8)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := l.Append(data); err != nil {
+				b.Error(err)
+
+				return
+			}
+		}
+	})
+}
+
 func BenchmarkRead(b *testing.B) {
 	const n = 100_000
 
-	l := openBench(b)
+	l := openBench(b, Config{})
 
 	data := make([][]byte, 1000)
 	for i := range data {
@@ -769,10 +957,10 @@ func openLogWith(t *testing.T, dir string, cfg Config, syncData func(*os.File) e
 	return l
 }
 
-func openBench(b *testing.B) *Log {
+func openBench(b *testing.B, cfg Config) *Log {
 	b.Helper()
 
-	l, err := Open(b.TempDir(), Config{})
+	l, err := Open(b.TempDir(), cfg)
 	if err != nil {
 		b.Fatal(err)
 	}

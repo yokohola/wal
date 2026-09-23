@@ -9,14 +9,18 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"slices"
 	"sync"
 	"time"
 )
 
-// DefaultSegmentSize applies when Config.SegmentSize is zero.
-const DefaultSegmentSize = 64 << 20
+// Defaults applied to zero Config fields.
+const (
+	DefaultSegmentSize   = 64 << 20
+	DefaultMaxRecordSize = 1 << 20
+)
 
 const (
 	// maxKeptBuffer bounds the encode buffer a Log keeps between appends.
@@ -34,11 +38,12 @@ var (
 	ErrInvalidConfig = errors.New("wal: invalid config")
 	ErrLocked        = errors.New("wal: directory locked by another process")
 	ErrOutOfRange    = errors.New("wal: index out of range")
-	ErrTooLarge      = errors.New("wal: batch too large")
+	ErrTooLarge      = errors.New("wal: too large")
 )
 
-// Config configures a Log. The zero value gives 64 MiB segments, no size cap
-// and fsync only where durability requires it: segment roll, Commit and Close.
+// Config configures a Log. The zero value gives 64 MiB segments, 1 MiB records,
+// no size cap and fsync only where durability requires it: segment roll, Commit
+// and Close.
 type Config struct {
 	// SegmentSize is the size at which the active segment is closed and a new
 	// one started. A batch is never split, so a segment may exceed it by one
@@ -50,8 +55,12 @@ type Config struct {
 	// must be at least SegmentSize.
 	MaxSize int64
 
-	// SyncOnAppend makes every Append durable before it returns. Batch records
-	// into one Append to amortize the fsync.
+	// MaxRecordSize caps the data of one record; Append rejects a larger one
+	// with ErrTooLarge. Records already on disk stay readable when it shrinks.
+	MaxRecordSize int64
+
+	// SyncOnAppend makes every Append durable before it returns. Concurrent
+	// Appends share an fsync; batching records into one Append amortizes it too.
 	SyncOnAppend bool
 
 	// SyncInterval makes appended records durable in the background at this
@@ -69,11 +78,12 @@ type Record struct {
 // Create it with Open and do not copy it.
 //
 // Methods are safe for concurrent use. Append, Commit, Sync and Close run one
-// at a time. Read and the accessors run alongside them and wait only while new
+// at a time; Appends that queue up meanwhile are written together and share
+// writes and fsyncs. Read and the accessors run alongside them and wait only while new
 // state is published, never during a write or fsync.
 //
 // Invariants: segments hold contiguous indexes and only the last, the active
-// segment, takes appends; FirstIndex <= Committed <= LastIndex+1; records below
+// segment, takes appends; FirstIndex-1 <= Committed <= LastIndex; records up to
 // Committed are durable.
 type Log struct {
 	dir      string
@@ -81,11 +91,18 @@ type Log struct {
 	lock     *os.File
 	syncData func(*os.File) error // fdatasync; tests substitute it
 
+	// queueMu guards the Appends waiting for the next group write.
+	queueMu sync.Mutex
+	queue   []*appendRequest
+
 	// writeMu serializes mutations and guards the fields below it.
 	writeMu   sync.Mutex
 	encodeBuf []byte
-	synced    uint64 // records below this index are durable
-	failed    error  // first write or fsync failure
+	synced    uint64     // records below this index are durable
+	syncedEnd int64      // offset of synced in the active segment
+	saved     checkpoint // last checkpoint written or loaded
+	failed    error      // first write or fsync failure
+	doomed    []*segment // reclaimed from segments, not yet deleted
 
 	// mu guards the fields below and the segments' state. They change only
 	// under writeMu and mu together, so holding either one is enough to read.
@@ -101,7 +118,9 @@ type Log struct {
 
 // Open opens or creates the log in dir. It repairs what a crash can leave
 // behind and fails with ErrCorrupt on any other damage, or with ErrLocked when
-// another process holds dir. Open reads every retained record to verify it.
+// another process holds dir. Open reads only the active segment past the end
+// the last Commit or Close made durable; the first Read of any other data
+// verifies it.
 func Open(dir string, cfg Config) (*Log, error) {
 	return open(dir, cfg, fdatasync)
 }
@@ -133,12 +152,21 @@ func open(dir string, cfg Config, syncData func(*os.File) error) (*Log, error) {
 }
 
 func (o Config) withDefaults() (Config, error) {
-	if o.SegmentSize < 0 || o.MaxSize < 0 || o.SyncInterval < 0 {
+	if o.SegmentSize < 0 || o.MaxSize < 0 || o.MaxRecordSize < 0 || o.SyncInterval < 0 {
 		return o, fmt.Errorf("%w: negative value", ErrInvalidConfig)
 	}
 
 	if o.SegmentSize == 0 {
 		o.SegmentSize = DefaultSegmentSize
+	}
+
+	if o.MaxRecordSize == 0 {
+		o.MaxRecordSize = DefaultMaxRecordSize
+	}
+
+	if o.MaxRecordSize > formatMaxRecordLen {
+		return o, fmt.Errorf("%w: MaxRecordSize %d exceeds the format limit %d",
+			ErrInvalidConfig, o.MaxRecordSize, int64(formatMaxRecordLen))
 	}
 
 	if o.MaxSize > 0 && o.MaxSize < o.SegmentSize {
@@ -153,68 +181,155 @@ func (o Config) withDefaults() (Config, error) {
 // any prefix of the batch, and a batch whose Append failed may still be found
 // after reopening. A write or fsync failure is sticky, see Log.
 func (l *Log) Append(data ...[]byte) (uint64, error) {
-	l.writeMu.Lock()
-	defer l.writeMu.Unlock()
-
-	if err := l.checkWritable(); err != nil {
-		return 0, err
-	}
-
 	if len(data) == 0 {
+		l.writeMu.Lock()
+		defer l.writeMu.Unlock()
+
+		if err := l.checkWritable(); err != nil {
+			return 0, err
+		}
+
 		return l.active().nextIndex() - 1, nil
 	}
 
-	batch, err := l.batchSize(data)
+	size, err := l.batchSize(data)
 	if err != nil {
 		return 0, err
 	}
 
-	if err := l.makeRoom(batch); err != nil {
-		return 0, err
+	req := &appendRequest{data: data, size: size, done: make(chan struct{})}
+
+	// The request that finds the queue empty leads: it writes everything queued
+	// by the time it holds writeMu. The others wait for their leader.
+	l.queueMu.Lock()
+	lead := len(l.queue) == 0
+	l.queue = append(l.queue, req)
+	l.queueMu.Unlock()
+
+	if lead {
+		l.writeMu.Lock()
+
+		l.queueMu.Lock()
+		group := l.queue
+		l.queue = nil
+		l.queueMu.Unlock()
+
+		l.writeGroup(group)
+		l.writeMu.Unlock()
 	}
 
-	return l.write(data)
+	<-req.done
+
+	return req.last, req.err
 }
 
 // Read returns up to limit records starting at from, fewer at the end of the
 // log. from must lie in [FirstIndex, LastIndex+1]; at LastIndex+1 the result is
 // empty. The caller owns the returned data. Records of one call may share a
-// backing array, but no slice's capacity reaches into another's bytes.
+// backing array, but no slice's capacity reaches into another's bytes. Damage
+// anywhere in a segment the read reaches fails it with ErrCorrupt.
 func (l *Log) Read(from uint64, limit int) ([]Record, error) {
+	for {
+		recs, unverified, err := l.read(from, limit)
+		if unverified == nil {
+			return recs, err
+		}
+
+		if err := l.verify(unverified); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// read is Read under the read lock. It stops at the first segment it reaches
+// that is not verified yet and returns that segment instead.
+func (l *Log) read(from uint64, limit int) ([]Record, *segment, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
 	if l.closed {
-		return nil, ErrClosed
+		return nil, nil, ErrClosed
 	}
 
 	first, next := l.segments[0].first, l.active().nextIndex()
 	if from < first || from > next {
-		return nil, fmt.Errorf("%w: %d outside [%d, %d]", ErrOutOfRange, from, first, next)
+		return nil, nil, fmt.Errorf("%w: %d outside [%d, %d]", ErrOutOfRange, from, first, next)
 	}
 
 	if limit <= 0 || from == next {
-		return []Record{}, nil
+		return []Record{}, nil, nil
 	}
 
 	out := make([]Record, 0, min(uint64(limit), next-from, maxReadPrealloc))
 
 	for i := l.segmentFor(from); i < len(l.segments) && len(out) < limit; i++ {
+		seg := l.segments[i]
+		if !seg.verified {
+			return nil, seg, nil
+		}
+
 		var err error
 
-		out, err = l.segments[i].read(from, limit, out)
+		out, err = seg.read(from, limit, out)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	return out, nil
+	return out, nil, nil
 }
 
-// Commit marks every record below index as processed. It makes those records
-// and the new checkpoint durable, then deletes segments holding only committed
-// records. An index at or below Committed changes nothing but retries deletions
-// that failed before. It fails with ErrOutOfRange above LastIndex+1.
+// verify checks the trusted part of seg without holding mu, so reads and
+// appends go on meanwhile, then publishes its index. A segment reclaimed in the
+// meantime needs no verifying. Damage found is reported for good.
+func (l *Log) verify(seg *segment) error {
+	seg.verifyMu.Lock()
+	defer seg.verifyMu.Unlock()
+
+	if seg.corrupt != nil {
+		return seg.corrupt
+	}
+
+	l.mu.RLock()
+	verified, reclaimed := seg.verified, seg.first < l.segments[0].first
+	l.mu.RUnlock()
+
+	if verified || reclaimed {
+		return nil
+	}
+
+	entries, err := seg.scanTrusted()
+	if errors.Is(err, fs.ErrNotExist) {
+		l.mu.RLock()
+		reclaimed = seg.first < l.segments[0].first
+		l.mu.RUnlock()
+
+		if reclaimed {
+			return nil
+		}
+	}
+
+	if errors.Is(err, ErrCorrupt) {
+		seg.corrupt = err
+	}
+
+	if err != nil {
+		return err
+	}
+
+	l.mu.Lock()
+	seg.sparseIndex = append(entries, seg.sparseIndex...)
+	seg.verified = true
+	l.mu.Unlock()
+
+	return nil
+}
+
+// Commit marks every record up to and including index as processed. It makes
+// those records and the new checkpoint durable, then deletes segments holding
+// only committed records. An index at or below Committed changes nothing but
+// retries deletions that failed before. It fails with ErrOutOfRange above
+// LastIndex.
 func (l *Log) Commit(index uint64) error {
 	l.writeMu.Lock()
 	defer l.writeMu.Unlock()
@@ -223,18 +338,19 @@ func (l *Log) Commit(index uint64) error {
 		return err
 	}
 
-	if next := l.active().nextIndex(); index > next {
-		return fmt.Errorf("%w: %d above %d", ErrOutOfRange, index, next)
+	if last := l.active().nextIndex() - 1; index > last {
+		return fmt.Errorf("%w: %d above %d", ErrOutOfRange, index, last)
 	}
 
 	if index > l.committed {
-		if index > l.synced {
+		if index >= l.synced {
 			if err := l.syncActive(); err != nil {
 				return err
 			}
 		}
 
-		if err := writeCheckpoint(l.dir, index); err != nil {
+		tail := l.active()
+		if err := l.saveCheckpoint(checkpoint{committed: index, segment: tail.first, end: l.syncedEnd, next: l.synced}); err != nil {
 			return err
 		}
 
@@ -246,8 +362,8 @@ func (l *Log) Commit(index uint64) error {
 	return l.reclaim()
 }
 
-// Committed returns the checkpoint: the first index not yet committed, where a
-// consumer resumes after Open.
+// Committed returns the index of the last committed record, or 0 when none. A
+// consumer resumes at Committed()+1 after Open.
 func (l *Log) Committed() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -272,8 +388,9 @@ func (l *Log) LastIndex() uint64 {
 	return l.active().nextIndex() - 1
 }
 
-// Size returns the bytes of all retained segments. Preallocation can make the
-// active segment take up to SegmentSize on disk before it fills.
+// Size returns the bytes of all segment files, including reclaimed ones whose
+// deletion failed. Preallocation can make the active segment take up to
+// SegmentSize on disk before it fills.
 func (l *Log) Size() int64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -293,9 +410,9 @@ func (l *Log) Sync() error {
 	return l.syncActive()
 }
 
-// Close makes appended records durable, stops the background sync and releases
-// the directory. After a failure it releases without syncing and returns that
-// failure.
+// Close makes appended records and their end durable, so the next Open reads
+// nothing, stops the background sync and releases the directory. After a
+// failure it releases without syncing and returns that failure.
 func (l *Log) Close() error {
 	l.writeMu.Lock()
 
@@ -320,7 +437,14 @@ func (l *Log) Close() error {
 		return errors.Join(l.failed, l.release())
 	}
 
-	return errors.Join(l.active().seal(), l.release())
+	tail := l.active()
+	if err := tail.seal(); err != nil {
+		return errors.Join(err, l.release())
+	}
+
+	cp := checkpoint{committed: l.committed, segment: tail.first, end: tail.size, next: tail.nextIndex()}
+
+	return errors.Join(l.saveCheckpoint(cp), l.release())
 }
 
 func (l *Log) active() *segment {
@@ -362,13 +486,13 @@ func (l *Log) fail(err error) error {
 }
 
 // batchSize returns the encoded size of data. It fails with ErrTooLarge when a
-// record exceeds the format limit or the batch can never fit MaxSize.
+// record exceeds MaxRecordSize or the batch can never fit MaxSize.
 func (l *Log) batchSize(data [][]byte) (int64, error) {
 	var total int64
 
 	for i, rec := range data {
-		if int64(len(rec)) > maxRecordSize {
-			return 0, fmt.Errorf("%w: record %d has %d bytes, limit %d", ErrTooLarge, i, len(rec), int64(maxRecordSize))
+		if int64(len(rec)) > l.cfg.MaxRecordSize {
+			return 0, fmt.Errorf("%w: record %d has %d bytes, MaxRecordSize %d", ErrTooLarge, i, len(rec), l.cfg.MaxRecordSize)
 		}
 
 		total += recordHeaderSize + int64(len(rec))
@@ -394,7 +518,7 @@ func (l *Log) makeRoom(batch int64) error {
 			after += segmentHeaderSize
 		}
 
-		if after > l.cfg.MaxSize && tail.count > 0 && tail.nextIndex() == l.committed {
+		if after > l.cfg.MaxSize && tail.count > 0 && tail.nextIndex() == l.committed+1 {
 			roll = true
 			after = l.size - tail.size + segmentHeaderSize + batch
 		}
@@ -415,43 +539,126 @@ func (l *Log) makeRoom(batch int64) error {
 	return l.reclaim()
 }
 
-// write appends the encoded batch to the active segment and publishes it.
-func (l *Log) write(data [][]byte) (uint64, error) {
-	tail := l.active()
+// appendRequest is a batch waiting in the queue. The leader of its group sets
+// last and err, then closes done.
+type appendRequest struct {
+	data [][]byte
+	size int64 // encoded size
 
-	buf := l.encodeBuf[:0]
-	for _, rec := range data {
-		buf = appendRecord(buf, rec)
+	done chan struct{}
+	last uint64
+	err  error
+}
+
+// writeGroup writes the queued batches in order, with the same outcome as
+// appending them one by one. Batches that fit the active segment are collected
+// and written with one write and one fsync.
+func (l *Log) writeGroup(group []*appendRequest) {
+	var (
+		pending []*appendRequest
+		buf     = l.encodeBuf[:0]
+	)
+
+	for _, req := range group {
+		if len(pending) > 0 && !l.fitsBehind(int64(len(buf)), req.size) {
+			l.flush(pending, buf)
+			pending, buf = pending[:0], buf[:0]
+		}
+
+		if req.err = l.checkWritable(); req.err != nil {
+			close(req.done)
+
+			continue
+		}
+
+		if len(pending) == 0 {
+			if req.err = l.makeRoom(req.size); req.err != nil {
+				close(req.done)
+
+				continue
+			}
+		}
+
+		for _, rec := range req.data {
+			buf = appendRecord(buf, rec)
+		}
+
+		pending = append(pending, req)
 	}
+
+	l.flush(pending, buf)
 
 	if cap(buf) <= maxKeptBuffer {
-		l.encodeBuf = buf
+		l.encodeBuf = buf[:0]
+	}
+}
+
+// fitsBehind reports whether a batch of size bytes fits the active segment and
+// MaxSize after pending bytes not yet published. With records pending, the
+// active segment is neither empty nor fully committed, so makeRoom would take
+// no other path.
+func (l *Log) fitsBehind(pending, size int64) bool {
+	if l.active().size+pending+size > l.cfg.SegmentSize {
+		return false
 	}
 
-	if _, err := tail.file.WriteAt(buf, tail.size); err != nil {
-		return 0, l.fail(wrap(err))
+	return l.cfg.MaxSize == 0 || l.size+pending+size <= l.cfg.MaxSize
+}
+
+// flush writes buf, the encoded batches of pending, to the active segment,
+// publishes them and completes their requests.
+func (l *Log) flush(pending []*appendRequest, buf []byte) {
+	if len(pending) == 0 {
+		return
 	}
 
-	if l.cfg.SyncOnAppend {
-		if err := l.syncData(tail.file); err != nil {
-			return 0, l.fail(wrap(err))
+	tail := l.active()
+
+	if err := l.writeActive(buf); err != nil {
+		for _, req := range pending {
+			req.err = err
+			close(req.done)
 		}
+
+		return
 	}
 
 	l.mu.Lock()
 
-	for _, rec := range data {
-		tail.addRecord(recordHeaderSize + int64(len(rec)))
+	for _, req := range pending {
+		for _, rec := range req.data {
+			tail.addRecord(recordHeaderSize + int64(len(rec)))
+		}
+
+		req.last = tail.nextIndex() - 1
 	}
 
 	l.size += int64(len(buf))
 	l.mu.Unlock()
 
 	if l.cfg.SyncOnAppend {
-		l.synced = tail.nextIndex()
+		l.markSynced()
 	}
 
-	return tail.nextIndex() - 1, nil
+	for _, req := range pending {
+		close(req.done)
+	}
+}
+
+func (l *Log) writeActive(buf []byte) error {
+	tail := l.active()
+
+	if _, err := tail.file.WriteAt(buf, tail.size); err != nil {
+		return l.fail(wrap(err))
+	}
+
+	if l.cfg.SyncOnAppend {
+		if err := l.syncData(tail.file); err != nil {
+			return l.fail(wrap(err))
+		}
+	}
+
+	return nil
 }
 
 // roll seals the active segment and starts the next one. Sealing comes first,
@@ -474,7 +681,7 @@ func (l *Log) roll() error {
 	l.size += segmentHeaderSize
 	l.mu.Unlock()
 
-	l.synced = next.first
+	l.markSynced()
 
 	if closeErr != nil {
 		return l.fail(closeErr)
@@ -483,26 +690,41 @@ func (l *Log) roll() error {
 	return nil
 }
 
-// reclaim deletes closed segments whose records are all committed. Readers hold
-// mu while they read, so a segment is never deleted under one.
+// reclaim deletes closed segments whose records are all committed. They leave
+// segments under mu, so no reader can reach them, and are deleted after it is
+// released. Size keeps counting a segment until its file is gone.
 func (l *Log) reclaim() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+
+	n := 0
+	for n < len(l.segments)-1 && l.segments[n].nextIndex() <= l.committed+1 {
+		n++
+	}
+
+	l.doomed = append(l.doomed, l.segments[:n]...)
+	l.segments = slices.Delete(l.segments, 0, n)
+	l.mu.Unlock()
 
 	var (
-		n   int
-		err error
+		removed int
+		freed   int64
+		err     error
 	)
 
-	for ; n < len(l.segments)-1 && l.segments[n].nextIndex() <= l.committed; n++ {
-		if err = removeFile(l.segments[n].path); err != nil {
+	for _, seg := range l.doomed {
+		if err = removeFile(seg.path); err != nil {
 			break
 		}
 
-		l.size -= l.segments[n].size
+		removed++
+		freed += seg.size
 	}
 
-	l.segments = slices.Delete(l.segments, 0, n)
+	l.doomed = slices.Delete(l.doomed, 0, removed)
+
+	l.mu.Lock()
+	l.size -= freed
+	l.mu.Unlock()
 
 	return err
 }
@@ -517,7 +739,28 @@ func (l *Log) syncActive() error {
 		return l.fail(wrap(err))
 	}
 
-	l.synced = tail.nextIndex()
+	l.markSynced()
+
+	return nil
+}
+
+// markSynced records that the active segment is durable up to its end.
+func (l *Log) markSynced() {
+	tail := l.active()
+	l.synced, l.syncedEnd = tail.nextIndex(), tail.size
+}
+
+// saveCheckpoint writes cp unless it is the checkpoint already on disk.
+func (l *Log) saveCheckpoint(cp checkpoint) error {
+	if cp == l.saved {
+		return nil
+	}
+
+	if err := writeCheckpoint(l.dir, cp); err != nil {
+		return err
+	}
+
+	l.saved = cp
 
 	return nil
 }

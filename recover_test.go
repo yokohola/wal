@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -164,9 +165,11 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 		return filepath.Join(dir, segmentName(first))
 	}
 
+	// Damage in data the checkpoint trusts surfaces on the first Read of it.
 	cases := map[string]struct {
 		damage func(t *testing.T, dir string)
 		reason string
+		onRead bool
 	}{
 		"flipped record in closed segment": {
 			damage: func(t *testing.T, dir string) {
@@ -174,6 +177,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				flipByte(t, path(dir, 1), segmentHeaderSize+recordHeaderSize+2)
 			},
 			reason: "data checksum mismatch",
+			onRead: true,
 		},
 		"flipped record in active segment": {
 			damage: func(t *testing.T, dir string) {
@@ -181,6 +185,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				flipByte(t, path(dir, 9), segmentHeaderSize+recordHeaderSize+2)
 			},
 			reason: "data checksum mismatch",
+			onRead: true,
 		},
 		"bad magic in closed segment": {
 			damage: func(t *testing.T, dir string) {
@@ -188,6 +193,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				flipByte(t, path(dir, 1), 0)
 			},
 			reason: "bad header",
+			onRead: true,
 		},
 		"bad magic in active segment": {
 			damage: func(t *testing.T, dir string) {
@@ -218,6 +224,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				appendBytes(t, path(dir, 1), []byte("garbage"))
 			},
 			reason: "runs past the end",
+			onRead: true,
 		},
 		"zeros after closed segment": {
 			damage: func(t *testing.T, dir string) {
@@ -225,6 +232,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				appendBytes(t, path(dir, 1), make([]byte, 100))
 			},
 			reason: "header checksum mismatch",
+			onRead: true,
 		},
 		"truncated closed segment": {
 			damage: func(t *testing.T, dir string) {
@@ -232,13 +240,15 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				require.NoError(t, os.Truncate(path(dir, 1), segmentOf(4)-3))
 			},
 			reason: "runs past the end",
+			onRead: true,
 		},
 		"missing middle segment": {
 			damage: func(t *testing.T, dir string) {
 				t.Helper()
 				require.NoError(t, os.Remove(path(dir, 5)))
 			},
-			reason: "ends at index 4 but the next segment starts at 9",
+			reason: "ends at index 4 but should end at 8",
+			onRead: true,
 		},
 		"corrupt checkpoint": {
 			damage: func(t *testing.T, dir string) {
@@ -252,14 +262,57 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				t.Helper()
 				require.NoError(t, os.Remove(path(dir, 1)))
 			},
-			reason: "checkpoint 2 is below the first segment 5",
+			reason: "checkpoint 2 but the first segment starts at 5",
+		},
+		"checkpoint one short of first segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, os.Remove(path(dir, 1)))
+				require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 3}))
+			},
+			reason: "checkpoint 3 but the first segment starts at 5",
+		},
+		"active segment shorter than its durable end": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, os.Truncate(path(dir, 9), segmentOf(1)))
+			},
+			reason: "does not fit",
+		},
+		"checkpoint names missing segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 2, segment: 7}))
+			},
+			reason: "checkpoint names segment 7, which is missing",
+		},
+		"checkpoint not past committed": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 10, segment: 9, end: segmentOf(2), next: 10}))
+			},
+			reason: "does not fit",
+		},
+		"checkpoint end without records": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 2, segment: 9, end: segmentHeaderSize, next: 11}))
+			},
+			reason: "does not fit",
+		},
+		"checkpoint claims more records than fit": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 2, segment: 9, end: segmentOf(2), next: 15}))
+			},
+			reason: "does not fit",
 		},
 		"checkpoint past last record": {
 			damage: func(t *testing.T, dir string) {
 				t.Helper()
-				require.NoError(t, writeCheckpoint(dir, 12))
+				require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 11}))
 			},
-			reason: "checkpoint 12 is past the last record 10",
+			reason: "checkpoint 11 is past the last record 10",
 		},
 		"no checkpoint after reclaim": {
 			damage: func(t *testing.T, dir string) {
@@ -294,7 +347,14 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 
 			tc.damage(t, dir)
 
-			_, err := Open(dir, cfg)
+			l, err := Open(dir, cfg)
+			if tc.onRead {
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, l.Close()) })
+
+				_, err = l.Read(l.FirstIndex(), 100)
+			}
+
 			require.ErrorIs(t, err, ErrCorrupt)
 			require.ErrorContains(t, err, tc.reason)
 		})
@@ -311,7 +371,7 @@ func TestReopen_FailureDeletesNothing(t *testing.T) {
 	require.NoError(t, l.Close())
 
 	// This checkpoint covers every segment but claims records that never existed.
-	require.NoError(t, writeCheckpoint(dir, 50))
+	require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 50}))
 
 	_, err := Open(dir, cfg)
 	require.ErrorIs(t, err, ErrCorrupt)
@@ -339,14 +399,14 @@ func TestReopen_DeletesSegmentsLeftBelowCheckpoint(t *testing.T) {
 			appendN(t, l, 10)
 			require.NoError(t, l.Close())
 
-			require.NoError(t, writeCheckpoint(dir, 9))
+			require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 8}))
 
 			for _, first := range removed {
 				require.NoError(t, os.Remove(filepath.Join(dir, segmentName(first))))
 			}
 
 			l = openLog(t, dir, cfg)
-			require.Equal(t, uint64(9), l.Committed())
+			require.Equal(t, uint64(8), l.Committed())
 			require.Equal(t, uint64(9), l.FirstIndex())
 			require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
 			requireRecords(t, readAll(t, l), 9, 2)
@@ -362,7 +422,7 @@ func TestReopen_DeletesCommittedSegmentBeforeEmptyActive(t *testing.T) {
 	dir := t.TempDir()
 	writeSegment(t, dir, 1, payload(1), payload(2), payload(3))
 	writeSegment(t, dir, 4)
-	require.NoError(t, writeCheckpoint(dir, 4))
+	require.NoError(t, writeCheckpoint(dir, checkpoint{committed: 3}))
 
 	l := openLog(t, dir, Config{})
 	require.Equal(t, uint64(4), l.FirstIndex())
@@ -398,6 +458,242 @@ func TestReopen_RemovesOnlyOwnTempFiles(t *testing.T) {
 	for _, name := range foreign {
 		require.FileExists(t, filepath.Join(dir, name))
 	}
+}
+
+// A crash after Commit leaves records the checkpoint does not cover. Open
+// trusts what it covers and scans only the rest.
+func TestReopen_ScansOnlyPastCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(8)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 3)
+	require.NoError(t, l.Commit(2))
+	appendN(t, l, 1)
+	require.NoError(t, l.Sync())
+
+	active := segmentName(1)
+	first, fourth := int64(segmentHeaderSize+recordHeaderSize), segmentOf(3)+recordHeaderSize
+
+	crashed := snapshot(t, dir)
+	appendBytes(t, filepath.Join(crashed, active), appendRecord(nil, payload(5))[:10])
+	l = openLog(t, crashed, cfg)
+	require.Equal(t, uint64(4), l.LastIndex(), "the torn tail is cut")
+	requireRecords(t, readAll(t, l), 1, 4)
+
+	trustedDamage := snapshot(t, dir)
+	flipByte(t, filepath.Join(trustedDamage, active), first)
+	l = openLog(t, trustedDamage, cfg)
+	require.Equal(t, uint64(4), l.LastIndex(), "trusted records are not read by Open")
+
+	_, err := l.Read(1, 1)
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	scannedDamage := snapshot(t, dir)
+	flipByte(t, filepath.Join(scannedDamage, active), fourth)
+	_, err = Open(scannedDamage, cfg)
+	require.ErrorIs(t, err, ErrCorrupt, "records past the checkpoint are scanned")
+}
+
+// When the log rolled after the last Commit, the new active segment is scanned
+// from its start and the closed ones are trusted.
+func TestReopen_ScansActiveFromStartAfterRoll(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 2)
+	require.NoError(t, l.Commit(1))
+	appendN(t, l, 4)
+	require.NoError(t, l.Sync())
+	require.Equal(t, []string{segmentName(1), segmentName(5)}, segmentFiles(t, dir))
+
+	closedDamage := snapshot(t, dir)
+	flipByte(t, filepath.Join(closedDamage, segmentName(1)), segmentHeaderSize+recordHeaderSize)
+	l = openLog(t, closedDamage, cfg)
+	require.Equal(t, uint64(6), l.LastIndex())
+
+	activeDamage := snapshot(t, dir)
+	flipByte(t, filepath.Join(activeDamage, segmentName(5)), segmentHeaderSize+recordHeaderSize)
+	_, err := Open(activeDamage, cfg)
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	l = openLog(t, snapshot(t, dir), cfg)
+	requireRecords(t, readAll(t, l), 1, 6)
+}
+
+// Trusted records are verified and indexed by concurrent first reads while
+// appends extend the same segment.
+func TestRead_VerifiesTrustedRecordsOnFirstRead(t *testing.T) {
+	t.Parallel()
+
+	const n = 1200
+
+	// Each segment spans several sparse index intervals.
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(400)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, n)
+	require.NoError(t, l.Close())
+
+	l = openLog(t, dir, cfg)
+	require.Greater(t, len(l.segments), 2)
+
+	var wg sync.WaitGroup
+
+	for range 8 {
+		wg.Go(func() {
+			for from := uint64(1); from <= n; from += 37 {
+				recs, err := l.Read(from, 5)
+				if err != nil {
+					t.Error(err)
+
+					return
+				}
+
+				for i, rec := range recs {
+					if rec.Index != from+uint64(i) || !bytes.Equal(rec.Data, payload(rec.Index)) {
+						t.Errorf("read %d: got index %d data %q", from, rec.Index, rec.Data)
+					}
+				}
+			}
+		})
+	}
+
+	wg.Go(func() {
+		for range 50 {
+			if _, err := l.Append(payload(l.LastIndex() + 1)); err != nil {
+				t.Error(err)
+
+				return
+			}
+		}
+	})
+
+	wg.Wait()
+
+	for from := uint64(1); from <= l.LastIndex(); from++ {
+		recs, err := l.Read(from, 1)
+		require.NoError(t, err)
+		requireRecords(t, recs, from, 1)
+	}
+}
+
+// Verification runs without the log's lock, so others go on meanwhile.
+func TestRead_VerificationDoesNotBlockOthers(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 10)
+	require.NoError(t, l.Close())
+
+	l = openLog(t, dir, cfg)
+	requireRecords(t, readAll(t, l)[8:], 9, 2)
+
+	// Holding verifyMu stands in for a long verification of the first segment.
+	first := l.segments[0]
+	first.verifyMu.Lock()
+
+	type result struct {
+		recs []Record
+		err  error
+	}
+
+	read := make(chan result, 1)
+	go func() {
+		recs, err := l.Read(1, 4)
+		read <- result{recs: recs, err: err}
+	}()
+
+	appendN(t, l, 1)
+	require.Equal(t, uint64(0), l.Committed())
+
+	recs, err := l.Read(5, 2)
+	require.NoError(t, err, "the second segment is verified independently")
+	requireRecords(t, recs, 5, 2)
+
+	first.verifyMu.Unlock()
+
+	got := <-read
+	require.NoError(t, got.err)
+	requireRecords(t, got.recs, 1, 4)
+}
+
+func TestRead_SegmentReclaimedDuringVerification(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 10)
+	require.NoError(t, l.Close())
+
+	l = openLog(t, dir, cfg)
+	first := l.segments[0]
+	first.verifyMu.Lock()
+
+	read := make(chan error, 1)
+	go func() {
+		_, err := l.Read(1, 4)
+		read <- err
+	}()
+
+	require.NoError(t, l.Commit(4))
+	require.NoFileExists(t, first.path)
+
+	first.verifyMu.Unlock()
+	require.ErrorIs(t, <-read, ErrOutOfRange)
+}
+
+func TestRead_ReportsDamageForGood(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 10)
+	require.NoError(t, l.Close())
+
+	path := filepath.Join(dir, segmentName(1))
+	offset := int64(segmentHeaderSize + recordHeaderSize)
+	flipByte(t, path, offset)
+
+	l = openLog(t, dir, cfg)
+
+	_, err := l.Read(1, 1)
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	flipByte(t, path, offset)
+
+	_, err = l.Read(4, 1)
+	require.ErrorIs(t, err, ErrCorrupt, "damage found once is not forgotten")
+
+	recs, err := l.Read(5, 6)
+	require.NoError(t, err, "other segments stay readable")
+	requireRecords(t, recs, 5, 6)
+}
+
+// snapshot copies the files of dir, as a crash would leave them, to a new
+// directory.
+func snapshot(t *testing.T, dir string) string {
+	t.Helper()
+
+	out := t.TempDir()
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(out, entry.Name()), data, 0o644))
+	}
+
+	return out
 }
 
 // writeSegment writes a segment file holding payloads and returns its path.
