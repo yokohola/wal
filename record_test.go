@@ -2,6 +2,8 @@ package wal
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -24,10 +26,10 @@ func TestRecord_RoundTrip(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			buf := appendRecord([]byte("prefix"), data)
+			buf := appendRecord([]byte("prefix"), 7, data)
 			require.Len(t, buf, len("prefix")+recordHeaderSize+len(data))
 
-			got, err := decodeRecord(buf[len("prefix"):])
+			got, err := decodeRecord(buf[len("prefix"):], 7)
 			require.NoError(t, err)
 			require.Equal(t, data, got)
 		})
@@ -37,49 +39,63 @@ func TestRecord_RoundTrip(t *testing.T) {
 func TestRecord_DecodeReportsFailureKind(t *testing.T) {
 	t.Parallel()
 
-	valid := appendRecord(nil, []byte("payload"))
+	valid := appendRecord(nil, 1, []byte("payload"))
 
 	cases := map[string]struct {
-		buf  []byte
-		want error
+		buf   []byte
+		index uint64
+		want  error
 	}{
-		"empty":          {buf: nil, want: errShortRecord},
-		"short header":   {buf: valid[:recordHeaderSize-1], want: errShortRecord},
-		"short data":     {buf: valid[:len(valid)-1], want: errShortRecord},
-		"zero header":    {buf: make([]byte, 64), want: errBadHeader},
-		"flipped length": {buf: flipped(valid, 0), want: errBadHeader},
-		"flipped crc":    {buf: flipped(valid, 5), want: errBadHeader},
-		"flipped data":   {buf: flipped(valid, len(valid)-1), want: errBadData},
+		"empty":          {buf: nil, index: 1, want: errShortRecord},
+		"short header":   {buf: valid[:recordHeaderSize-1], index: 1, want: errShortRecord},
+		"short data":     {buf: valid[:len(valid)-1], index: 1, want: errShortRecord},
+		"zero header":    {buf: make([]byte, 64), index: 1, want: errBadHeader},
+		"flipped length": {buf: flipped(valid, 0), index: 1, want: errBadHeader},
+		"flipped crc":    {buf: flipped(valid, 5), index: 1, want: errBadHeader},
+		"flipped data":   {buf: flipped(valid, len(valid)-1), index: 1, want: errBadData},
+		"other index":    {buf: valid, index: 2, want: errBadData},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := decodeRecord(tc.buf)
+			_, err := decodeRecord(tc.buf, tc.index)
 			require.ErrorIs(t, err, tc.want)
 		})
+	}
+}
+
+func TestRecord_DataChecksumCoversIndexThenData(t *testing.T) {
+	t.Parallel()
+
+	for _, index := range []uint64{0, 1, 0x0102030405060708, math.MaxUint64} {
+		for _, data := range [][]byte{nil, []byte("payload")} {
+			want := crc32.Checksum(binary.LittleEndian.AppendUint64(nil, index), crcTable)
+			want = crc32.Update(want, crcTable, data)
+			require.Equal(t, want, dataChecksum(index, data))
+		}
 	}
 }
 
 func TestRecord_EmptyRecordDiffersFromZeroFill(t *testing.T) {
 	t.Parallel()
 
-	require.NotEqual(t, make([]byte, recordHeaderSize), appendRecord(nil, nil))
+	require.NotEqual(t, make([]byte, recordHeaderSize), appendRecord(nil, 1, nil))
 }
 
 func TestRecord_DecodedDataDoesNotReachNextRecord(t *testing.T) {
 	t.Parallel()
 
-	buf := appendRecord(appendRecord(nil, []byte("first")), []byte("second"))
+	buf := appendRecord(appendRecord(nil, 1, []byte("first")), 2, []byte("second"))
 
-	first, err := decodeRecord(buf)
+	first, err := decodeRecord(buf, 1)
 	require.NoError(t, err)
 	require.Equal(t, len(first), cap(first))
 
 	_ = append(first, "XXXXXXXXXXXXXXXXXXXX"...)
 
-	second, err := decodeRecord(buf[recordHeaderSize+len("first"):])
+	second, err := decodeRecord(buf[recordHeaderSize+len("first"):], 2)
 	require.NoError(t, err)
 	require.Equal(t, []byte("second"), second)
 }
@@ -97,15 +113,15 @@ func TestRecordReader_CrossesChunks(t *testing.T) {
 	for i, size := range sizes {
 		data := bytes.Repeat([]byte{byte('a' + i)}, size)
 		want = append(want, data)
-		buf = appendRecord(buf, data)
+		buf = appendRecord(buf, uint64(i+1), data)
 	}
 
 	reader := recordReader{src: bytes.NewReader(buf), end: int64(len(buf))}
 
 	var got [][]byte
 
-	for {
-		data, err := reader.next()
+	for index := uint64(1); ; index++ {
+		data, err := reader.next(index)
 		if err == io.EOF {
 			break
 		}
@@ -121,17 +137,17 @@ func TestRecordReader_CrossesChunks(t *testing.T) {
 func TestRecordReader_StopsAtFailingRecord(t *testing.T) {
 	t.Parallel()
 
-	buf := appendRecord(nil, []byte("good"))
+	buf := appendRecord(nil, 1, []byte("good"))
 	failAt := int64(len(buf))
-	buf = appendRecord(buf, []byte("bad"))
+	buf = appendRecord(buf, 2, []byte("bad"))
 	buf[len(buf)-1] ^= 0xff
 
 	reader := recordReader{src: bytes.NewReader(buf), end: int64(len(buf))}
 
-	_, err := reader.next()
+	_, err := reader.next(1)
 	require.NoError(t, err)
 
-	_, err = reader.next()
+	_, err = reader.next(2)
 	require.ErrorIs(t, err, errBadData)
 	require.Equal(t, failAt, reader.offset)
 }
@@ -139,17 +155,17 @@ func TestRecordReader_StopsAtFailingRecord(t *testing.T) {
 func TestRecordReader_SkipsRecordWithBadData(t *testing.T) {
 	t.Parallel()
 
-	buf := appendRecord(nil, []byte("bad"))
+	buf := appendRecord(nil, 1, []byte("bad"))
 	buf[len(buf)-1] ^= 0xff
-	buf = appendRecord(buf, []byte("next"))
+	buf = appendRecord(buf, 2, []byte("next"))
 
 	reader := recordReader{src: bytes.NewReader(buf), end: int64(len(buf))}
 
-	_, err := reader.next()
+	_, err := reader.next(1)
 	require.ErrorIs(t, err, errBadData)
 	require.NoError(t, reader.skip())
 
-	data, err := reader.next()
+	data, err := reader.next(2)
 	require.NoError(t, err)
 	require.Equal(t, []byte("next"), data)
 }
@@ -157,7 +173,7 @@ func TestRecordReader_SkipsRecordWithBadData(t *testing.T) {
 func TestRecordReader_SkipNeedsIntactHeader(t *testing.T) {
 	t.Parallel()
 
-	buf := appendRecord(nil, []byte("bad"))
+	buf := appendRecord(nil, 1, []byte("bad"))
 	buf[0] ^= 0xff
 
 	reader := recordReader{src: bytes.NewReader(buf), end: int64(len(buf))}
@@ -168,10 +184,10 @@ func TestRecordReader_SkipNeedsIntactHeader(t *testing.T) {
 func TestRecordReader_FileShorterThanEnd(t *testing.T) {
 	t.Parallel()
 
-	buf := appendRecord(nil, []byte("payload"))
+	buf := appendRecord(nil, 1, []byte("payload"))
 	reader := recordReader{src: bytes.NewReader(buf[:len(buf)-2]), end: int64(len(buf))}
 
-	_, err := reader.next()
+	_, err := reader.next(1)
 	require.ErrorIs(t, err, errShortRecord)
 }
 

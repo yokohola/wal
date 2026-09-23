@@ -16,7 +16,7 @@ func TestReopen_RestoresState(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
@@ -38,7 +38,7 @@ func TestReopen_RestoresState(t *testing.T) {
 func TestReopen_CutsTornTail(t *testing.T) {
 	t.Parallel()
 
-	valid := appendRecord(nil, payload(4))
+	valid := appendRecord(nil, 4, payload(4))
 
 	cases := map[string][]byte{
 		"short header":           valid[:recordHeaderSize-3],
@@ -284,7 +284,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			cfg := Config{SegmentSize: segmentOf(4)}
+			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 			l := openLog(t, dir, cfg)
 			appendN(t, l, 10)
 			require.NoError(t, l.Commit(2))
@@ -303,7 +303,7 @@ func TestReopen_FailureDeletesNothing(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Close())
@@ -332,7 +332,7 @@ func TestReopen_DeletesSegmentsLeftBelowCheckpoint(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			cfg := Config{SegmentSize: segmentOf(4)}
+			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 			l := openLog(t, dir, cfg)
 			appendN(t, l, 10)
 			require.NoError(t, l.Close())
@@ -404,7 +404,7 @@ func TestReopen_ScansOnlyPastCheckpoint(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(8)}
+	cfg := Config{SegmentSize: segmentOf(8), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 3)
 	require.NoError(t, l.Commit(2))
@@ -415,7 +415,7 @@ func TestReopen_ScansOnlyPastCheckpoint(t *testing.T) {
 	first, fourth := int64(segmentHeaderSize+recordHeaderSize), segmentOf(3)+recordHeaderSize
 
 	crashed := snapshot(t, dir)
-	appendBytes(t, filepath.Join(crashed, active), appendRecord(nil, payload(5))[:10])
+	appendBytes(t, filepath.Join(crashed, active), appendRecord(nil, 5, payload(5))[:10])
 	l = openLog(t, crashed, cfg)
 	require.Equal(t, uint64(4), l.LastIndex(), "the torn tail is cut")
 	requireRecords(t, readAll(t, l), 1, 4)
@@ -440,7 +440,7 @@ func TestReopen_ScansActiveFromStartAfterRoll(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 2)
 	require.NoError(t, l.Commit(1))
@@ -471,7 +471,7 @@ func TestRead_VerifiesTrustedRecordsOnFirstRead(t *testing.T) {
 
 	// Each segment spans several sparse index intervals.
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(400)}
+	cfg := Config{SegmentSize: segmentOf(400), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, n)
 	require.NoError(t, l.Close())
@@ -524,7 +524,7 @@ func TestRead_VerificationDoesNotBlockOthers(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Close())
@@ -565,7 +565,7 @@ func TestRead_SegmentReclaimedDuringVerification(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Close())
@@ -688,7 +688,7 @@ func TestRead_ReportsLostTrustedRecords(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			cfg := Config{SegmentSize: segmentOf(4)}
+			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 			l := openLog(t, dir, cfg)
 			appendN(t, l, 10)
 			require.NoError(t, l.Close())
@@ -741,7 +741,7 @@ func TestRead_EveryFlippedTrustedByteLosesItsRange(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Close())
@@ -828,6 +828,39 @@ func TestRead_ReportsLostWrittenRecords(t *testing.T) {
 	}
 }
 
+// A record's checksum covers its index, so intact records moved to another
+// position read as damage rather than as data at the wrong index.
+func TestRead_ReportsSwappedRecords(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 10)
+	require.NoError(t, l.Close())
+
+	swapRecords(t, filepath.Join(dir, segmentName(1)), 2, 3)
+
+	l = openLog(t, dir, cfg)
+	require.Equal(t, []uint64{2, 3}, lostIndexes(t, l))
+}
+
+func TestReopen_RejectsSwappedRecordsPastCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	l := openLog(t, dir, Config{})
+	appendN(t, l, 3)
+	require.NoError(t, l.Sync())
+
+	crashed := snapshot(t, dir)
+	swapRecords(t, filepath.Join(crashed, segmentName(1)), 2, 3)
+
+	_, err := Open(crashed, Config{})
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.ErrorIs(t, err, errBadData)
+}
+
 // Verification can find fewer or more trusted records than the checkpoint
 // claims. Reads keep the records past the trusted bytes apart from them, so
 // neither shifts their indexes.
@@ -875,7 +908,7 @@ func TestRead_RemembersUnlocatedRecords(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Close())
@@ -908,13 +941,13 @@ func TestRead_IgnoresBytesAfterTrustedRecords(t *testing.T) {
 	for name, extra := range map[string][]byte{
 		"garbage": []byte("garbage"),
 		"zeros":   make([]byte, 100),
-		"record":  appendRecord(nil, payload(5)),
+		"record":  appendRecord(nil, 5, payload(5)),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			cfg := Config{SegmentSize: segmentOf(4)}
+			cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 			l := openLog(t, dir, cfg)
 			appendN(t, l, 10)
 			require.NoError(t, l.Close())
@@ -1002,14 +1035,35 @@ func writeSegment(t *testing.T, dir string, first uint64, payloads ...[]byte) st
 	header := segmentHeader(first)
 	buf := header[:]
 
-	for _, data := range payloads {
-		buf = appendRecord(buf, data)
+	for i, data := range payloads {
+		buf = appendRecord(buf, first+uint64(i), data)
 	}
 
 	path := filepath.Join(dir, segmentName(first))
 	require.NoError(t, os.WriteFile(path, buf, 0o644))
 
 	return path
+}
+
+// swapRecords swaps records a and b of the segment at path, which starts at
+// index 1 and holds only test payloads.
+func swapRecords(t *testing.T, path string, a, b uint64) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	at := func(index uint64) []byte {
+		offset := segmentOf(int(index - 1))
+
+		return data[offset : offset+testRecordSize]
+	}
+
+	first := bytes.Clone(at(a))
+	copy(at(a), at(b))
+	copy(at(b), first)
+
+	require.NoError(t, os.WriteFile(path, data, 0o644))
 }
 
 func zeroRange(t *testing.T, path string, from, to int64) {

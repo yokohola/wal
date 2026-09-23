@@ -60,26 +60,22 @@ type CorruptError struct {
 // and Close.
 type Config struct {
 	// SegmentSize is the size at which the active segment is closed and a new
-	// one started. A batch is never split, so a segment may exceed it by one
-	// batch unless RejectBatchOnSegmentSize is set.
+	// one started. A record is never split, so a segment holding one record of
+	// SegmentSize bytes exceeds it by that record's framing.
 	SegmentSize int64
 
-	// RejectBatchOnSegmentSize makes Append fail with ErrTooLarge on a batch
-	// that does not fit an empty segment, so no segment exceeds SegmentSize.
-	// A record of MaxRecordSize must then fit one.
-	RejectBatchOnSegmentSize bool
-
 	// MaxWALSize caps Size, the bytes of all segments. Append fails with ErrFull
-	// while a batch does not fit and with ErrTooLarge when it never can. Zero
-	// means no cap; otherwise it must be at least SegmentSize.
+	// while a record does not fit. Zero means no cap; otherwise it must be at
+	// least SegmentSize.
 	MaxWALSize int64
 
 	// MaxRecordSize caps the data of one record; Append rejects a larger one
-	// with ErrTooLarge. Records already on disk stay readable when it shrinks.
+	// with ErrTooLarge. It must not exceed SegmentSize. Records already on disk
+	// stay readable when it shrinks.
 	MaxRecordSize int64
 
 	// SyncOnAppend makes every Append durable before it returns. Concurrent
-	// Appends share an fsync; batching records into one Append amortizes it too.
+	// Appends share an fsync.
 	SyncOnAppend bool
 
 	// SyncInterval makes appended records durable in the background at this
@@ -129,15 +125,15 @@ type Log struct {
 	syncDone chan struct{}
 }
 
-// appendRequest is a batch waiting in the queue. The leader of its group sets
-// last and err, then closes done.
+// appendRequest is a record waiting in the queue. The leader of its group sets
+// index and err, then closes done.
 type appendRequest struct {
-	data [][]byte
+	data []byte
 	size int64 // encoded size
 
-	done chan struct{}
-	last uint64
-	err  error
+	done  chan struct{}
+	index uint64
+	err   error
 }
 
 // Open opens or creates the log in dir, repairing what a crash can leave behind.
@@ -186,9 +182,8 @@ func (c Config) withDefaults() (Config, error) {
 			ErrInvalidConfig, c.MaxRecordSize, int64(formatMaxRecordLen))
 	}
 
-	largest := segmentHeaderSize + recordHeaderSize + c.MaxRecordSize
-	if c.RejectBatchOnSegmentSize && largest > c.SegmentSize {
-		return c, fmt.Errorf("%w: a record of MaxRecordSize %d does not fit SegmentSize %d",
+	if c.MaxRecordSize > c.SegmentSize {
+		return c, fmt.Errorf("%w: MaxRecordSize %d exceeds SegmentSize %d",
 			ErrInvalidConfig, c.MaxRecordSize, c.SegmentSize)
 	}
 
@@ -213,21 +208,11 @@ func (e *CorruptError) Unwrap() error {
 	return e.Err
 }
 
-// Append writes data as consecutive records and returns the last one's index.
-// A crash can keep any prefix of the batch, even of one whose Append failed.
-func (l *Log) Append(data ...[]byte) (uint64, error) {
-	if len(data) == 0 {
-		l.writeMu.Lock()
-		defer l.writeMu.Unlock()
-
-		if err := l.checkWritable(); err != nil {
-			return 0, err
-		}
-
-		return l.active().nextIndex() - 1, nil
-	}
-
-	size, err := l.batchSize(data)
+// Append writes data as one record and returns its index. The record is atomic:
+// after a crash it is either whole or absent, never partial. A record whose
+// Append failed may still survive a crash.
+func (l *Log) Append(data []byte) (uint64, error) {
+	size, err := l.recordSize(data)
 	if err != nil {
 		return 0, err
 	}
@@ -255,7 +240,7 @@ func (l *Log) Append(data ...[]byte) (uint64, error) {
 
 	<-req.done
 
-	return req.last, req.err
+	return req.index, req.err
 }
 
 // Read returns up to limit records from index from, which must lie in
@@ -568,48 +553,33 @@ func (l *Log) fail(err error) error {
 	return l.failed
 }
 
-// batchSize returns the encoded size of data. It fails with ErrTooLarge when a
-// record exceeds MaxRecordSize or the batch can never fit MaxWALSize, or an
-// empty segment when RejectBatchOnSegmentSize is set.
-func (l *Log) batchSize(data [][]byte) (int64, error) {
-	var total int64
-
-	for i, rec := range data {
-		if int64(len(rec)) > l.cfg.MaxRecordSize {
-			return 0, fmt.Errorf("%w: record %d has %d bytes, MaxRecordSize %d",
-				ErrTooLarge, i, len(rec), l.cfg.MaxRecordSize)
-		}
-
-		total += recordHeaderSize + int64(len(rec))
+// recordSize returns the encoded size of data. It fails with ErrTooLarge when
+// data exceeds MaxRecordSize.
+func (l *Log) recordSize(data []byte) (int64, error) {
+	if int64(len(data)) > l.cfg.MaxRecordSize {
+		return 0, fmt.Errorf("%w: record has %d bytes, MaxRecordSize %d",
+			ErrTooLarge, len(data), l.cfg.MaxRecordSize)
 	}
 
-	if l.cfg.RejectBatchOnSegmentSize && segmentHeaderSize+total > l.cfg.SegmentSize {
-		return 0, fmt.Errorf("%w: %d bytes do not fit SegmentSize %d", ErrTooLarge, total, l.cfg.SegmentSize)
-	}
-
-	if l.cfg.MaxWALSize > 0 && segmentHeaderSize+total > l.cfg.MaxWALSize {
-		return 0, fmt.Errorf("%w: %d bytes never fit MaxWALSize %d", ErrTooLarge, total, l.cfg.MaxWALSize)
-	}
-
-	return total, nil
+	return recordHeaderSize + int64(len(data)), nil
 }
 
-// makeRoom rolls to a new segment when the batch overflows the active one, or
+// makeRoom rolls to a new segment when the record overflows the active one, or
 // when the active segment is fully committed and rolling it away frees the
-// space the batch needs. It fails with ErrFull when the batch does not fit.
-func (l *Log) makeRoom(batch int64) error {
+// space the record needs. It fails with ErrFull when the record does not fit.
+func (l *Log) makeRoom(size int64) error {
 	tail := l.active()
-	roll := tail.count > 0 && tail.size+batch > l.cfg.SegmentSize
+	roll := tail.count > 0 && tail.size+size > l.cfg.SegmentSize
 
 	if l.cfg.MaxWALSize > 0 {
-		after := l.size + batch
+		after := l.size + size
 		if roll {
 			after += segmentHeaderSize
 		}
 
 		if after > l.cfg.MaxWALSize && tail.count > 0 && tail.nextIndex() == l.committed+1 {
 			roll = true
-			after = l.size - tail.size + segmentHeaderSize + batch
+			after = l.size - tail.size + segmentHeaderSize + size
 		}
 
 		if after > l.cfg.MaxWALSize {
@@ -628,8 +598,8 @@ func (l *Log) makeRoom(batch int64) error {
 	return l.reclaim()
 }
 
-// writeGroup writes the queued batches in order. Each batch gets the result it
-// would get if appended alone, and batches that fit the active segment together
+// writeGroup writes the queued records in order. Each record gets the result it
+// would get if appended alone, and records that fit the active segment together
 // share one write and fsync.
 func (l *Log) writeGroup(group []*appendRequest) {
 	var (
@@ -657,10 +627,9 @@ func (l *Log) writeGroup(group []*appendRequest) {
 			}
 		}
 
-		for _, rec := range req.data {
-			buf = appendRecord(buf, rec)
-		}
-
+		// Pending records are not yet counted in the active segment.
+		index := l.active().nextIndex() + uint64(len(pending))
+		buf = appendRecord(buf, index, req.data)
 		pending = append(pending, req)
 	}
 
@@ -671,7 +640,7 @@ func (l *Log) writeGroup(group []*appendRequest) {
 	}
 }
 
-// fitsBehind reports whether a batch fits in the active segment and MaxWALSize
+// fitsBehind reports whether a record fits in the active segment and MaxWALSize
 // right after the pending bytes. Only then can it join the pending write, since
 // makeRoom would not roll for it.
 func (l *Log) fitsBehind(pending, size int64) bool {
@@ -682,7 +651,7 @@ func (l *Log) fitsBehind(pending, size int64) bool {
 	return l.cfg.MaxWALSize == 0 || l.size+pending+size <= l.cfg.MaxWALSize
 }
 
-// flush writes buf, the encoded batches of pending, to the active segment,
+// flush writes buf, the encoded records of pending, to the active segment,
 // publishes them and completes their requests.
 func (l *Log) flush(pending []*appendRequest, buf []byte) {
 	if len(pending) == 0 {
@@ -703,11 +672,8 @@ func (l *Log) flush(pending []*appendRequest, buf []byte) {
 	l.mu.Lock()
 
 	for _, req := range pending {
-		for _, rec := range req.data {
-			tail.addRecord(recordHeaderSize + int64(len(rec)))
-		}
-
-		req.last = tail.nextIndex() - 1
+		tail.addRecord(req.size)
+		req.index = tail.nextIndex() - 1
 	}
 
 	l.size += int64(len(buf))

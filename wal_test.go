@@ -44,11 +44,10 @@ func TestOpen_RejectsInvalidConfig(t *testing.T) {
 		"negative max record size":        {MaxRecordSize: -1},
 		"record size above format":        {MaxRecordSize: math.MaxUint32 + 1},
 		"negative sync interval":          {SyncInterval: -time.Second},
-		"max wal size below segment size": {SegmentSize: 1024, MaxWALSize: 1023},
+		"max wal size below segment size": {SegmentSize: 1024, MaxRecordSize: 100, MaxWALSize: 1023},
 		"max wal size below default":      {MaxWALSize: DefaultSegmentSize - 1},
-		"record does not fit segment": {
-			SegmentSize: 1024, MaxRecordSize: 1024 - segmentHeaderSize - recordHeaderSize + 1, RejectBatchOnSegmentSize: true,
-		},
+		"record above segment":            {SegmentSize: 1024, MaxRecordSize: 1025},
+		"default record above segment":    {SegmentSize: 1024},
 	}
 
 	for name, cfg := range cases {
@@ -86,11 +85,11 @@ func TestAppend_AssignsConsecutiveIndexes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), last)
 
-	last, err = l.Append(payload(2), payload(3))
+	last, err = l.Append(payload(2))
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), last)
+	require.Equal(t, uint64(2), last)
 
-	last, err = l.Append()
+	last, err = l.Append(payload(3))
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), last)
 
@@ -121,8 +120,11 @@ func TestAppend_AllowsEmptyRecords(t *testing.T) {
 	dir := t.TempDir()
 	l := openLog(t, dir, Config{})
 
-	_, err := l.Append(nil, []byte{}, []byte("x"))
-	require.NoError(t, err)
+	for _, data := range [][]byte{nil, {}, []byte("x")} {
+		_, err := l.Append(data)
+		require.NoError(t, err)
+	}
+
 	require.NoError(t, l.Close())
 
 	l = openLog(t, dir, Config{})
@@ -139,7 +141,7 @@ func TestAppend_RollsSegments(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Config{SegmentSize: segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize})
 
 	appendN(t, l, 10)
 
@@ -154,81 +156,27 @@ func TestAppend_RollsSegments(t *testing.T) {
 	requireRecords(t, readAll(t, l), 1, 10)
 }
 
-func TestAppend_BatchLargerThanSegmentGetsOwnSegment(t *testing.T) {
+func TestAppend_RecordOfSegmentSizeGetsOwnSegment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Config{SegmentSize: segmentOf(2)})
+	cfg := Config{SegmentSize: 1024, MaxRecordSize: 1024}
+	l := openLog(t, dir, cfg)
 
-	appendN(t, l, 1)
-
-	_, err := l.Append(payload(2), payload(3), payload(4), payload(5))
+	_, err := l.Append(make([]byte, cfg.MaxRecordSize))
 	require.NoError(t, err)
 
-	appendN(t, l, 1)
-
-	require.Equal(t, []string{segmentName(1), segmentName(2), segmentName(6)}, segmentFiles(t, dir))
-	requireRecords(t, readAll(t, l), 1, 6)
-}
-
-func TestAppend_RejectsBatchThatNeverFits(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxWALSize: 2 * segmentOf(4)})
-	appendN(t, l, 4)
-
-	batch := make([][]byte, 9)
-	for i := range batch {
-		batch[i] = payload(uint64(5 + i))
-	}
-
-	_, err := l.Append(batch...)
-	require.ErrorIs(t, err, ErrTooLarge)
-
-	_, err = l.Append(make([]byte, 2*segmentOf(4)))
-	require.ErrorIs(t, err, ErrTooLarge)
-
-	require.Equal(t, uint64(4), l.LastIndex())
-	require.Equal(t, []string{segmentName(1)}, segmentFiles(t, dir), "a rejected batch does not roll")
-
-	appendN(t, l, 1)
-	requireRecords(t, readAll(t, l), 1, 5)
-}
-
-func TestAppend_RejectBatchOnSegmentSize(t *testing.T) {
-	t.Parallel()
-
-	exact := Config{SegmentSize: 1024, MaxRecordSize: 1024 - segmentHeaderSize - recordHeaderSize, RejectBatchOnSegmentSize: true}
-	openLog(t, t.TempDir(), exact)
-
-	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize, RejectBatchOnSegmentSize: true}
-	l := openLog(t, dir, cfg)
-	appendN(t, l, 1)
-
-	five := make([][]byte, 5)
-	for i := range five {
-		five[i] = payload(uint64(i + 2))
-	}
-
-	_, err := l.Append(five...)
-	require.ErrorIs(t, err, ErrTooLarge)
-	require.Equal(t, uint64(1), l.LastIndex(), "nothing of a rejected batch is written")
-	require.Equal(t, []string{segmentName(1)}, segmentFiles(t, dir), "a rejected batch does not roll")
-
-	last, err := l.Append(five[:4]...)
-	require.NoError(t, err, "a batch filling an empty segment exactly fits")
-	require.Equal(t, uint64(5), last)
+	last, err := l.Append(make([]byte, cfg.MaxRecordSize))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), last)
 	require.Equal(t, []string{segmentName(1), segmentName(2)}, segmentFiles(t, dir))
 	require.NoError(t, l.Close())
 
-	info, err := os.Stat(filepath.Join(dir, segmentName(2)))
-	require.NoError(t, err)
-	require.Equal(t, segmentOf(4), info.Size())
-
-	l = openLog(t, dir, cfg)
-	requireRecords(t, readAll(t, l), 1, 5)
+	for _, first := range []uint64{1, 2} {
+		info, err := os.Stat(filepath.Join(dir, segmentName(first)))
+		require.NoError(t, err)
+		require.Equal(t, segmentHeaderSize+recordHeaderSize+cfg.SegmentSize, info.Size(), "only the framing exceeds SegmentSize")
+	}
 }
 
 func TestAppend_BoundsRecordSize(t *testing.T) {
@@ -240,9 +188,9 @@ func TestAppend_BoundsRecordSize(t *testing.T) {
 	_, err := l.Append(make([]byte, 100))
 	require.NoError(t, err)
 
-	_, err = l.Append(payload(2), make([]byte, 101))
+	_, err = l.Append(make([]byte, 101))
 	require.ErrorIs(t, err, ErrTooLarge)
-	require.Equal(t, uint64(1), l.LastIndex(), "no record of a rejected batch is written")
+	require.Equal(t, uint64(1), l.LastIndex(), "a rejected record is not written")
 	require.Equal(t, segmentHeaderSize+recordHeaderSize+int64(100), l.Size())
 	require.NoError(t, l.Close())
 
@@ -268,7 +216,7 @@ func TestAppend_DefaultMaxRecordSize(t *testing.T) {
 func TestRead_Ranges(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(3)})
+	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(3), MaxRecordSize: payloadSize})
 	appendN(t, l, 10)
 
 	cases := []struct {
@@ -313,7 +261,7 @@ func TestRead_FromAnyIndex(t *testing.T) {
 	const n = 600
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: 64 << 10}
+	cfg := Config{SegmentSize: 64 << 10, MaxRecordSize: 700}
 	l := openLog(t, dir, cfg)
 
 	want := make([][]byte, n+1)
@@ -437,7 +385,7 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize}
 	l := openLog(t, dir, cfg)
 
 	require.NoError(t, l.Commit(0), "nothing to commit")
@@ -502,7 +450,7 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Config{SegmentSize: segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize})
 	appendN(t, l, 10)
 
 	// A non-empty directory in place of the first segment makes its removal fail.
@@ -531,46 +479,38 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 func TestMaxSize_AppliesBackpressure(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(4), MaxWALSize: 2 * segmentOf(4)})
-	appendN(t, l, 7)
+	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize, MaxWALSize: 2 * segmentOf(4)})
+	appendN(t, l, 8)
 
-	_, err := l.Append(payload(8), payload(9))
+	_, err := l.Append(payload(9))
 	require.ErrorIs(t, err, ErrFull)
-	require.Equal(t, uint64(7), l.LastIndex(), "nothing is written on ErrFull")
+	require.Equal(t, uint64(8), l.LastIndex(), "nothing is written on ErrFull")
 
 	require.NoError(t, l.Commit(4))
 	appendN(t, l, 2)
-	requireRecords(t, readAll(t, l), 5, 5)
+	requireRecords(t, readAll(t, l), 5, 6)
 }
 
 func TestMaxSize_RollsAwayCommittedActiveSegment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxWALSize: 2 * segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize, MaxWALSize: segmentOf(4)})
+	appendN(t, l, 4)
 
-	// One batch fills the active segment far past SegmentSize.
-	batch := make([][]byte, 8)
-	for i := range batch {
-		batch[i] = payload(uint64(i + 1))
-	}
+	_, err := l.Append(payload(5))
+	require.ErrorIs(t, err, ErrFull, "the full active segment leaves no room")
 
-	_, err := l.Append(batch...)
-	require.NoError(t, err)
-
-	next := [][]byte{payload(9), payload(10), payload(11), payload(12)}
-
-	require.NoError(t, l.Commit(4))
-	_, err = l.Append(next...)
+	require.NoError(t, l.Commit(2))
+	_, err = l.Append(payload(5))
 	require.ErrorIs(t, err, ErrFull, "uncommitted records keep the segment")
 
-	require.NoError(t, l.Commit(8))
-	_, err = l.Append(next...)
-	require.NoError(t, err)
+	require.NoError(t, l.Commit(4))
+	appendN(t, l, 4)
 
-	require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
+	require.Equal(t, []string{segmentName(5)}, segmentFiles(t, dir))
 	require.Equal(t, segmentOf(4), l.Size())
-	requireRecords(t, readAll(t, l), 9, 4)
+	requireRecords(t, readAll(t, l), 5, 4)
 }
 
 func TestSync_OnAppend(t *testing.T) {
@@ -583,8 +523,6 @@ func TestSync_OnAppend(t *testing.T) {
 	appendN(t, l, 3)
 	require.Equal(t, int64(3), calls.Load())
 
-	_, err := l.Append()
-	require.NoError(t, err)
 	require.NoError(t, l.Sync())
 	require.Equal(t, int64(3), calls.Load(), "nothing left to sync")
 }
@@ -670,21 +608,25 @@ func TestSync_ConcurrentAppendsShareOneFsync(t *testing.T) {
 	}
 }
 
-func TestAppend_GroupKeepsPerBatchOutcome(t *testing.T) {
+func TestAppend_GroupKeepsPerRecordOutcome(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(2), MaxWALSize: 2 * segmentOf(2)}
+	cfg := Config{
+		SegmentSize:   segmentOf(2),
+		MaxRecordSize: segmentOf(2) - segmentHeaderSize - recordHeaderSize,
+		MaxWALSize:    2 * segmentOf(2),
+	}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 1)
 
-	request := func(data ...[]byte) *appendRequest {
-		return &appendRequest{data: data, size: int64(len(data)) * testRecordSize, done: make(chan struct{})}
+	request := func(data []byte) *appendRequest {
+		return &appendRequest{data: data, size: recordHeaderSize + int64(len(data)), done: make(chan struct{})}
 	}
 
 	fits := request(payload(2))
 	rolls := request(payload(3))
-	full := request(payload(0), payload(0))
+	full := request(make([]byte, cfg.MaxRecordSize)) // needs a whole segment
 	fitsAfter := request(payload(4))
 
 	l.writeMu.Lock()
@@ -700,12 +642,12 @@ func TestAppend_GroupKeepsPerBatchOutcome(t *testing.T) {
 	}
 
 	require.NoError(t, fits.err)
-	require.Equal(t, uint64(2), fits.last)
+	require.Equal(t, uint64(2), fits.index)
 	require.NoError(t, rolls.err)
-	require.Equal(t, uint64(3), rolls.last)
+	require.Equal(t, uint64(3), rolls.index)
 	require.ErrorIs(t, full.err, ErrFull)
 	require.NoError(t, fitsAfter.err)
-	require.Equal(t, uint64(4), fitsAfter.last)
+	require.Equal(t, uint64(4), fitsAfter.index)
 
 	require.Equal(t, []string{segmentName(1), segmentName(3)}, segmentFiles(t, dir))
 	requireRecords(t, readAll(t, l), 1, 4)
@@ -780,7 +722,7 @@ func TestFailure_IsSticky(t *testing.T) {
 
 	injected := errors.New("injected fsync failure")
 	dir := t.TempDir()
-	cfg := Config{SyncOnAppend: true, SegmentSize: segmentOf(2)}
+	cfg := Config{SyncOnAppend: true, SegmentSize: segmentOf(2), MaxRecordSize: payloadSize}
 
 	setSyncData(t, func(file *os.File) error {
 		if failing.Load() {
@@ -823,7 +765,7 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 		total     = writers * perWriter
 	)
 
-	l := openLog(t, t.TempDir(), Config{SegmentSize: 4096, SyncInterval: time.Millisecond})
+	l := openLog(t, t.TempDir(), Config{SegmentSize: 4096, MaxRecordSize: 64, SyncInterval: time.Millisecond})
 
 	var wg sync.WaitGroup
 
@@ -894,24 +836,16 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 }
 
 func BenchmarkAppend(b *testing.B) {
-	for _, batch := range []int{1, 100} {
-		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) {
-			l := openBench(b, Config{})
+	l := openBench(b, Config{})
+	data := make([]byte, 160)
 
-			data := make([][]byte, batch)
-			for i := range data {
-				data[i] = make([]byte, 160)
-			}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
 
-			b.SetBytes(int64(batch * 160))
-			b.ReportAllocs()
-
-			for b.Loop() {
-				if _, err := l.Append(data...); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
+	for b.Loop() {
+		if _, err := l.Append(data); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -937,13 +871,10 @@ func BenchmarkRead(b *testing.B) {
 
 	l := openBench(b, Config{})
 
-	data := make([][]byte, 1000)
-	for i := range data {
-		data[i] = make([]byte, 160)
-	}
+	data := make([]byte, 160)
 
-	for range n / len(data) {
-		if _, err := l.Append(data...); err != nil {
+	for range n {
+		if _, err := l.Append(data); err != nil {
 			b.Fatal(err)
 		}
 	}

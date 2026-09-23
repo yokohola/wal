@@ -18,8 +18,10 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	if _, err := l.Append([]byte("set a"), []byte("set b")); err != nil {
-		log.Fatal(err)
+	for _, cmd := range []string{"set a", "set b"} {
+		if _, err := l.Append([]byte(cmd)); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

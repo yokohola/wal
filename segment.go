@@ -20,7 +20,7 @@ import (
 const (
 	segmentExt        = ".wal"
 	segmentMagic      = "WALS"
-	segmentVersion    = 1
+	segmentVersion    = 2
 	segmentHeaderSize = 16
 	segmentNameDigits = 20
 
@@ -144,7 +144,7 @@ func (s *segment) scanTrusted() (verification, error) {
 	for prefix.nextIndex() < s.trustedNext {
 		start := reader.offset
 
-		_, err := reader.next()
+		_, err := reader.next(prefix.nextIndex())
 		if errors.Is(err, errBadData) {
 			err = reader.skip()
 		}
@@ -247,7 +247,7 @@ func (s *segment) read(from uint64, limit int, out []Record) ([]Record, error) {
 		for ; len(out) < limit && index < next; index++ {
 			at := reader.offset
 
-			data, err := reader.next()
+			data, err := reader.next(index)
 			if errors.Is(err, errBadData) && index < from {
 				err = reader.skip()
 			}
@@ -296,7 +296,7 @@ func (s *segment) scan(file *os.File, end int64) error {
 	reader := recordReader{src: file, offset: s.size, end: end}
 
 	for {
-		data, err := reader.next()
+		data, err := reader.next(s.nextIndex())
 		if errors.Is(err, io.EOF) {
 			return nil
 		}

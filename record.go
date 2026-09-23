@@ -9,8 +9,10 @@ import (
 )
 
 // A record is a 12-byte header and its data. The header holds the data length,
-// a CRC32C of the data and a CRC32C of those first 8 bytes, so a damaged length
-// is caught before it is trusted. Zero bytes never form a valid header.
+// a CRC32C of the record's index and data and a CRC32C of those first 8 bytes,
+// so a damaged length is caught before it is trusted. The index is not stored:
+// it follows from the record's position, and a record found at another position
+// fails its data checksum. Zero bytes never form a valid header.
 const (
 	recordHeaderSize   = 12
 	formatMaxRecordLen = math.MaxUint32
@@ -26,7 +28,10 @@ var (
 	errBadData     = errors.New("record data checksum mismatch")
 )
 
-var crcTable = crc32.MakeTable(crc32.Castagnoli)
+var (
+	crcTable      = crc32.MakeTable(crc32.Castagnoli)
+	indexCRCTable = makeIndexCRCTable()
+)
 
 // recordReader decodes consecutive records from src between offset and end.
 // Every fetch allocates a new chunk, so returned data stays valid.
@@ -37,15 +42,16 @@ type recordReader struct {
 	chunk  []byte
 }
 
-// next returns the data of the next record or io.EOF at end. On a decode error
-// offset stays at the failing record; after errBadData, skip passes over it.
-func (r *recordReader) next() ([]byte, error) {
+// next returns the data of the next record, which must have index, or io.EOF at
+// end. On a decode error offset stays at the failing record; after errBadData,
+// skip passes over it.
+func (r *recordReader) next(index uint64) ([]byte, error) {
 	size, err := r.locate()
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := decodeRecord(r.chunk[:size])
+	data, err := decodeRecord(r.chunk[:size], index)
 	if err != nil {
 		return nil, err
 	}
@@ -123,13 +129,13 @@ func (r *recordReader) fill(n int64) error {
 	return nil
 }
 
-// appendRecord frames data and appends it to dst. The caller ensures that
-// len(data) <= formatMaxRecordLen.
-func appendRecord(dst, data []byte) []byte {
+// appendRecord frames data as the record with index and appends it to dst. The
+// caller ensures that len(data) <= formatMaxRecordLen.
+func appendRecord(dst []byte, index uint64, data []byte) []byte {
 	start := len(dst)
 
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(data)))
-	dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(data, crcTable))
+	dst = binary.LittleEndian.AppendUint32(dst, dataChecksum(index, data))
 	dst = binary.LittleEndian.AppendUint32(dst, crc32.Checksum(dst[start:start+8], crcTable))
 
 	return append(dst, data...)
@@ -148,9 +154,10 @@ func decodeHeader(buf []byte) (int64, error) {
 	return int64(binary.LittleEndian.Uint32(buf[0:4])), nil
 }
 
-// decodeRecord returns the data of the record starting buf. The result aliases
-// buf with its capacity capped, so appending to it never touches what follows.
-func decodeRecord(buf []byte) ([]byte, error) {
+// decodeRecord returns the data of the record starting buf, which must have
+// index. The result aliases buf with its capacity capped, so appending to it
+// never touches what follows.
+func decodeRecord(buf []byte, index uint64) ([]byte, error) {
 	length, err := decodeHeader(buf)
 	if err != nil {
 		return nil, err
@@ -162,11 +169,42 @@ func decodeRecord(buf []byte) ([]byte, error) {
 	}
 
 	data := buf[recordHeaderSize:end:end]
-	if crc32.Checksum(data, crcTable) != binary.LittleEndian.Uint32(buf[4:8]) {
+	if dataChecksum(index, data) != binary.LittleEndian.Uint32(buf[4:8]) {
 		return nil, errBadData
 	}
 
 	return data, nil
+}
+
+// dataChecksum is the CRC32C of index, as 8 little-endian bytes, and data.
+// The index goes through indexCRCTable, since a slice of its bytes would escape
+// to the heap through crc32.
+func dataChecksum(index uint64, data []byte) uint32 {
+	crc := ^uint32(index)
+	hi := index >> 32
+	crc = indexCRCTable[0][byte(hi>>24)] ^ indexCRCTable[1][byte(hi>>16)] ^
+		indexCRCTable[2][byte(hi>>8)] ^ indexCRCTable[3][byte(hi)] ^
+		indexCRCTable[4][byte(crc>>24)] ^ indexCRCTable[5][byte(crc>>16)] ^
+		indexCRCTable[6][byte(crc>>8)] ^ indexCRCTable[7][byte(crc)]
+
+	return crc32.Update(^crc, crcTable, data)
+}
+
+// makeIndexCRCTable builds slicing-by-8 tables for crcTable: entry [k][b] is
+// the CRC contribution of byte b followed by k zero bytes, so the 8 bytes of an
+// index take 8 independent lookups.
+func makeIndexCRCTable() *[8]crc32.Table {
+	var tab [8]crc32.Table
+
+	tab[0] = *crcTable
+	for k := 1; k < 8; k++ {
+		for b := range 256 {
+			prev := tab[k-1][b]
+			tab[k][b] = prev>>8 ^ crcTable[byte(prev)]
+		}
+	}
+
+	return &tab
 }
 
 // isDecodeError reports whether err is a failure to decode a record or segment

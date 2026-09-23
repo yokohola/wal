@@ -17,10 +17,9 @@ Fast, crash-consistent, append-only write-ahead log for Go.
 
 ## Features
 
-- **Crash-safe.** Committed records always survive a crash. `Open` repairs a
+- **Crash-safe.** Committed records always survive a crash. Each `Append`
+  writes one record, which a crash keeps whole or not at all. `Open` repairs a
   half-written tail by itself and never returns damaged data.
-- **Fast restart.** `Open` reads only what was written since the last
-  `Commit`, so startup time doesn't grow with the size of the log.
 - **Group commit.** Concurrent `Append` calls are grouped into a single write
   and fsync, so many writers pay for one fsync instead of one each.
 - **Reads never block.** Readers never wait on writes or fsyncs, and any
@@ -34,9 +33,6 @@ Fast, crash-consistent, append-only write-ahead log for Go.
 
 ## Quick start
 
-```sh
-go get github.com/yokohola/wal
-```
 
 ```go
 l, err := wal.Open("/var/lib/myapp/wal", wal.Config{SyncOnAppend: true})
@@ -45,7 +41,7 @@ if err != nil {
 }
 defer l.Close()
 
-last, err := l.Append([]byte("set a"), []byte("set b")) // indexes last-1 and last
+last, err := l.Append([]byte("set a"))
 if err != nil {
 	return err
 }
@@ -96,19 +92,45 @@ func consume(ctx context.Context, l *wal.Log) error {
 |---|---|---|
 | `SegmentSize` | 64 MiB | Roll to a new segment at this size. |
 | `MaxWALSize` | no cap | Total size cap; `Append` returns `ErrFull` until more is committed. |
-| `MaxRecordSize` | 1 MiB | Larger records are rejected with `ErrTooLarge`. |
-| `RejectBatchOnSegmentSize` | `false` | Reject batches that would push a segment past `SegmentSize`. |
+| `MaxRecordSize` | 1 MiB | Larger records are rejected with `ErrTooLarge`. Must not exceed `SegmentSize`. |
 | `SyncOnAppend` | `false` | fsync before every `Append` returns; concurrent appends share one. |
 | `SyncInterval` | off | fsync in the background at this period. |
 
 Segment roll, `Commit`, `Close` and `Sync` always fsync.
+
+## High load
+
+- **Many writers:** set `SyncOnAppend`. Concurrent appends share one fsync.
+- **Throughput over per-call durability:** use `SyncInterval` instead of
+  `SyncOnAppend`. A power loss can lose the last interval; a process crash
+  cannot.
+- **Reads:** read in batches (`Read(next, 1024)`). A 128-record read costs
+  about the same as a single-record read.
+- **Disk:** set `MaxWALSize` and treat `ErrFull` as backpressure.
+
+## Performance
+
+Apple M3 Pro, macOS, Go 1.26, 256-byte records, 64 MiB segments. Medians of
+three runs; reads use a warmed 100,000-record dataset.
+
+| Operation | wal | tidwall | RoseDB | HashiCorp |
+|---|---|---|---|---|
+| Single append, no sync | 1.43 µs | 1.40 µs | 1.39 µs | n/a |
+| Single durable append | 2.58 ms | 2.61 ms | 2.65 ms | 1.70 ms |
+| Durable appends, 16 writers | **2,993 rec/s** | 368 rec/s | 331 rec/s | 484 rec/s |
+| Random single-record read | 22.8 µs | 0.098 µs | 1.74 µs | 3.35 µs |
+| Sequential read, 128 records | 24.0 µs | 3.52 µs | 111 µs | 231 µs |
+
+Group commit gives 6 to 9× the durable throughput with concurrent writers.
+tidwall serves reads from an in-memory cache without checksum validation;
+`wal` reads the segment files and validates every record.
 
 ## Errors
 
 | Error | When |
 |---|---|
 | `ErrFull` | The log is at `MaxWALSize`; commit, then retry. |
-| `ErrTooLarge` | The record or batch can never fit. |
+| `ErrTooLarge` | The record exceeds `MaxRecordSize`. |
 | `ErrCorrupt` | Damage a crash cannot cause. `Read` returns the records before it, then a `*CorruptError` naming the lost range; read from `Last+1` to skip it. |
 | `ErrOutOfRange` | Index outside `[FirstIndex, LastIndex+1]`. |
 | `ErrLocked` | Another process holds the directory. |
