@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"time"
 
-	"wal"
+	"github.com/yokohola/wal"
 )
 
 // A producer appends and a consumer resumes from the checkpoint after every

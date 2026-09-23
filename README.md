@@ -1,7 +1,9 @@
 # wal
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/yokohola/wal.svg)](https://pkg.go.dev/github.com/yokohola/wal)
 [![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)](go.mod)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Fast, crash-consistent, append-only write-ahead log for Go.
 
@@ -31,6 +33,10 @@ Fast, crash-consistent, append-only write-ahead log for Go.
   from opening the same directory.
 
 ## Quick start
+
+```sh
+go get github.com/yokohola/wal
+```
 
 ```go
 l, err := wal.Open("/var/lib/myapp/wal", wal.Config{SyncOnAppend: true})
