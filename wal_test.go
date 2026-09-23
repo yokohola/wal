@@ -375,14 +375,12 @@ func TestRead_RecordsDoNotShareCapacity(t *testing.T) {
 }
 
 func TestRead_DoesNotWaitForSync(t *testing.T) {
-	t.Parallel()
-
 	var blocking atomic.Bool
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
 
-	l := openLogWith(t, t.TempDir(), Config{SyncOnAppend: true}, func(file *os.File) error {
+	setSyncData(t, func(file *os.File) error {
 		if blocking.Load() {
 			entered <- struct{}{}
 			<-release
@@ -390,9 +388,11 @@ func TestRead_DoesNotWaitForSync(t *testing.T) {
 
 		return file.Sync()
 	})
+
+	l := openLog(t, t.TempDir(), Config{SyncOnAppend: true})
 	appendN(t, l, 2)
 
-	// Registered after openLogWith, so it runs first and Close never waits on a
+	// Registered after openLog, so it runs first and Close never waits on a
 	// blocked fsync.
 	var unblock sync.Once
 
@@ -470,14 +470,12 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 }
 
 func TestCommit_SyncsRecordsBeforeCheckpoint(t *testing.T) {
-	t.Parallel()
-
 	dir := t.TempDir()
 
 	// Each sync records the checkpoint on disk at that moment.
 	var seen []uint64
 
-	l := openLogWith(t, dir, Config{}, func(file *os.File) error {
+	setSyncData(t, func(file *os.File) error {
 		cp, _, err := readCheckpoint(dir)
 		require.NoError(t, err)
 
@@ -485,6 +483,8 @@ func TestCommit_SyncsRecordsBeforeCheckpoint(t *testing.T) {
 
 		return file.Sync()
 	})
+
+	l := openLog(t, dir, Config{})
 
 	appendN(t, l, 3)
 	require.NoError(t, l.Commit(2))
@@ -574,11 +574,11 @@ func TestMaxSize_RollsAwayCommittedActiveSegment(t *testing.T) {
 }
 
 func TestSync_OnAppend(t *testing.T) {
-	t.Parallel()
-
 	var calls atomic.Int64
 
-	l := openLogWith(t, t.TempDir(), Config{SyncOnAppend: true}, countingSync(&calls))
+	setSyncData(t, countingSync(&calls))
+
+	l := openLog(t, t.TempDir(), Config{SyncOnAppend: true})
 
 	appendN(t, l, 3)
 	require.Equal(t, int64(3), calls.Load())
@@ -590,8 +590,6 @@ func TestSync_OnAppend(t *testing.T) {
 }
 
 func TestSync_ConcurrentAppendsShareOneFsync(t *testing.T) {
-	t.Parallel()
-
 	const queued = 10
 
 	var (
@@ -603,7 +601,7 @@ func TestSync_ConcurrentAppendsShareOneFsync(t *testing.T) {
 	release := make(chan struct{})
 
 	dir := t.TempDir()
-	l := openLogWith(t, dir, Config{SyncOnAppend: true}, func(file *os.File) error {
+	setSyncData(t, func(file *os.File) error {
 		calls.Add(1)
 
 		if blocking.CompareAndSwap(true, false) {
@@ -613,6 +611,8 @@ func TestSync_ConcurrentAppendsShareOneFsync(t *testing.T) {
 
 		return file.Sync()
 	})
+
+	l := openLog(t, dir, Config{SyncOnAppend: true})
 
 	blocking.Store(true)
 
@@ -716,11 +716,11 @@ func TestAppend_GroupKeepsPerBatchOutcome(t *testing.T) {
 }
 
 func TestSync_OnDemand(t *testing.T) {
-	t.Parallel()
-
 	var calls atomic.Int64
 
-	l := openLogWith(t, t.TempDir(), Config{}, countingSync(&calls))
+	setSyncData(t, countingSync(&calls))
+
+	l := openLog(t, t.TempDir(), Config{})
 
 	appendN(t, l, 3)
 	require.Zero(t, calls.Load())
@@ -735,11 +735,11 @@ func TestSync_OnDemand(t *testing.T) {
 }
 
 func TestSync_InBackground(t *testing.T) {
-	t.Parallel()
-
 	var calls atomic.Int64
 
-	l := openLogWith(t, t.TempDir(), Config{SyncInterval: time.Millisecond}, countingSync(&calls))
+	setSyncData(t, countingSync(&calls))
+
+	l := openLog(t, t.TempDir(), Config{SyncInterval: time.Millisecond})
 	appendN(t, l, 3)
 
 	require.Eventually(t, func() bool { return calls.Load() > 0 }, 5*time.Second, time.Millisecond)
@@ -776,21 +776,21 @@ func TestClose_RejectsFurtherUse(t *testing.T) {
 }
 
 func TestFailure_IsSticky(t *testing.T) {
-	t.Parallel()
-
 	var failing atomic.Bool
 
 	injected := errors.New("injected fsync failure")
 	dir := t.TempDir()
 	cfg := Config{SyncOnAppend: true, SegmentSize: segmentOf(2)}
 
-	l := openLogWith(t, dir, cfg, func(file *os.File) error {
+	setSyncData(t, func(file *os.File) error {
 		if failing.Load() {
 			return injected
 		}
 
 		return file.Sync()
 	})
+
+	l := openLog(t, dir, cfg)
 	appendN(t, l, 3)
 
 	failing.Store(true)
@@ -977,13 +977,7 @@ func segmentOf(n int) int64 {
 func openLog(t *testing.T, dir string, cfg Config) *Log {
 	t.Helper()
 
-	return openLogWith(t, dir, cfg, fdatasync)
-}
-
-func openLogWith(t *testing.T, dir string, cfg Config, syncData func(*os.File) error) *Log {
-	t.Helper()
-
-	l, err := open(dir, cfg, syncData)
+	l, err := Open(dir, cfg)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -993,6 +987,17 @@ func openLogWith(t *testing.T, dir string, cfg Config, syncData func(*os.File) e
 	})
 
 	return l
+}
+
+// setSyncData replaces syncData until the test ends. Callers must not run in
+// parallel, and must call it before opening a log so the log closes first.
+func setSyncData(t *testing.T, fn func(*os.File) error) {
+	t.Helper()
+
+	prev := syncData
+	syncData = fn
+
+	t.Cleanup(func() { syncData = prev })
 }
 
 func openBench(b *testing.B, cfg Config) *Log {

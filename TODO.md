@@ -25,17 +25,11 @@ and records appended to the active segment after Open.
 
 To research: what a Read should return in this case.
 
-### No streaming reads
-
-Problem: `Read` returns `[]byte`, so one large record is allocated whole.
-
-Note: MaxRecordSize bounds one record, not a Read. `Read(from, limit)` can
-still hold `limit` × MaxRecordSize.
-
 ## Decisions
 
 - CRC32C stays mandatory. It is part of the format and recovery depends on it.
 - Not planned: retryable ENOSPC at segment roll, a default MaxWALSize or
-  retention independent of Commit, incremental CRC during recovery.
+  retention independent of Commit, incremental CRC during recovery, streaming
+  reads.
 - No blocking Wait for consumers. Read returns empty at the end; the consumer
   decides how to wait.

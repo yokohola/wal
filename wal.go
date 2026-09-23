@@ -41,6 +41,9 @@ var (
 	ErrTooLarge      = errors.New("wal: too large")
 )
 
+// syncData makes a file's written data durable.
+var syncData = fdatasync
+
 // Config configures a Log. The zero value gives 64 MiB segments, 1 MiB records,
 // no size cap and fsync only where durability requires it: segment roll, Commit
 // and Close.
@@ -86,10 +89,9 @@ type Record struct {
 // appends, FirstIndex-1 <= Committed <= LastIndex, and committed records are
 // durable.
 type Log struct {
-	dir      string
-	cfg      Config
-	lock     *os.File
-	syncData func(*os.File) error // fdatasync; tests substitute it
+	dir  string
+	cfg  Config
+	lock *os.File
 
 	// queueMu guards the Appends waiting for the next group write.
 	queueMu sync.Mutex
@@ -130,10 +132,6 @@ type appendRequest struct {
 // Open opens or creates the log in dir, repairing what a crash can leave behind.
 // It fails with ErrCorrupt on other damage and with ErrLocked when dir is held.
 func Open(dir string, cfg Config) (*Log, error) {
-	return open(dir, cfg, fdatasync)
-}
-
-func open(dir string, cfg Config, syncData func(*os.File) error) (*Log, error) {
 	cfg, err := cfg.withDefaults()
 	if err != nil {
 		return nil, err
@@ -148,7 +146,7 @@ func open(dir string, cfg Config, syncData func(*os.File) error) (*Log, error) {
 		return nil, err
 	}
 
-	l := &Log{dir: dir, cfg: cfg, lock: lock, syncData: syncData}
+	l := &Log{dir: dir, cfg: cfg, lock: lock}
 
 	if err := l.load(); err != nil {
 		return nil, errors.Join(err, l.release())
@@ -706,7 +704,7 @@ func (l *Log) writeActive(buf []byte) error {
 	}
 
 	if l.cfg.SyncOnAppend {
-		if err := l.syncData(tail.file); err != nil {
+		if err := syncData(tail.file); err != nil {
 			return l.fail(wrap(err))
 		}
 	}
@@ -787,7 +785,7 @@ func (l *Log) syncActive() error {
 		return nil
 	}
 
-	if err := l.syncData(tail.file); err != nil {
+	if err := syncData(tail.file); err != nil {
 		return l.fail(wrap(err))
 	}
 
