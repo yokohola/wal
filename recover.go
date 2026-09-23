@@ -18,9 +18,7 @@ const sectorSize = 512
 var zeroSector [sectorSize]byte
 
 // listSegments returns the first indexes of the segments in dir, ascending. It
-// deletes the temp files a crash leaves while a segment, an index or the
-// checkpoint is written, and index files whose segment is gone. It leaves every
-// other file alone.
+// deletes this package's temp files and orphaned index files, nothing else.
 func listSegments(dir string) ([]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -146,9 +144,8 @@ func closeSegments(segments []*segment) error {
 	return err
 }
 
-// loadClosedSegment opens a closed segment for reading and verifies all of it.
-// It was sealed before the next one was created, so a crash cannot have torn
-// it. A segment verified without its index gets one for the next Open.
+// loadClosedSegment opens a closed segment for reading and verifies it, which a
+// crash cannot have torn. A segment verified without its index gets one.
 func loadClosedSegment(dir string, first, next uint64) (*segment, error) {
 	seg := newSegment(dir, first)
 
@@ -178,9 +175,8 @@ func loadClosedSegment(dir string, first, next uint64) (*segment, error) {
 	return seg, nil
 }
 
-// recoverActiveSegment opens the last segment for appending, scanning past the
-// checkpoint. A torn tail is truncated and synced before any append. Records
-// the checkpoint covers are verified like a closed segment's.
+// recoverActiveSegment opens the last segment for appending, verifying what the
+// checkpoint covers and scanning past it; a torn tail is truncated and synced.
 func recoverActiveSegment(
 	dir string, first uint64, cp checkpoint, prealloc int64,
 ) (*segment, error) {
@@ -221,7 +217,8 @@ func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc in
 		if cp.end < segmentHeaderSize || cp.end > info.Size() || cp.next < seg.first ||
 			cp.next <= cp.committed || empty != (cp.next == seg.first) ||
 			cp.next-seg.first > uint64(cp.end-segmentHeaderSize)/recordHeaderSize {
-			return fmt.Errorf("%w: checkpoint end %d at index %d, committed %d, does not fit %s of %d bytes",
+			return fmt.Errorf(
+				"%w: checkpoint end %d at index %d, committed %d, does not fit %s of %d bytes",
 				ErrCorrupt, cp.end, cp.next, cp.committed, seg.path, info.Size())
 		}
 

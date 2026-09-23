@@ -434,7 +434,8 @@ func (l *Log) load() error {
 		segments = []*segment{seg}
 	default:
 		if !found && firsts[0] != 1 {
-			return fmt.Errorf("%w: no checkpoint but the first segment starts at %d", ErrCorrupt, firsts[0])
+			return fmt.Errorf("%w: no checkpoint but the first segment starts at %d",
+				ErrCorrupt, firsts[0])
 		}
 
 		segments, err = loadSegments(l.dir, firsts, cp, l.cfg.SegmentSize)

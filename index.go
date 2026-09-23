@@ -9,15 +9,10 @@ import (
 	"os"
 )
 
-// An index file keeps the sparse index of a sealed segment, so Open need not
-// scan the segment to rebuild it. It holds a magic, the
-// format version, the segment's first index, end offset and next index, the
-// entries as index and offset, and the CRC32C of everything before it.
-//
-// The index is a cache. It is written without fsync and used only when it
-// matches the segment's trusted records; otherwise the segment is scanned. A
-// record's checksum covers its index, so a wrong entry makes reads fail as
-// corruption and never returns a record under a wrong index.
+// An index file caches a sealed segment's sparse index so Open need not scan it:
+// a header (magic, version, first index, end, next index), entries and CRC32C.
+// It is written without fsync and used only when it matches the segment; a
+// wrong entry fails reads and never returns a record under a wrong index.
 const (
 	indexExt        = ".idx"
 	indexMagic      = "WALI"
@@ -88,7 +83,8 @@ func decodeIndex(buf []byte, first uint64, end int64, next uint64) ([]indexEntry
 	}
 
 	if entries[0] != (indexEntry{index: first, offset: segmentHeaderSize}) {
-		return nil, fmt.Errorf("%w: first entry %d at %d", errBadIndex, entries[0].index, entries[0].offset)
+		return nil, fmt.Errorf("%w: first entry %d at %d",
+			errBadIndex, entries[0].index, entries[0].offset)
 	}
 
 	for i := 1; i < len(entries); i++ {
@@ -128,7 +124,8 @@ func readIndex(path string, first uint64, end int64, next uint64) ([]indexEntry,
 	}
 
 	size := info.Size()
-	if (size-indexHeaderSize-indexCRCSize)/indexEntrySize > (end-segmentHeaderSize)/recordHeaderSize {
+	entries := (size - indexHeaderSize - indexCRCSize) / indexEntrySize
+	if entries > (end-segmentHeaderSize)/recordHeaderSize {
 		return nil, fmt.Errorf("%w: %s has %d bytes", errBadIndex, path, size)
 	}
 

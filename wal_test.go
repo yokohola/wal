@@ -1365,10 +1365,9 @@ func openLog(t *testing.T, dir string, cfg Config) *Log {
 
 // openTracker records the files openSegment opens.
 type openTracker struct {
-	onOpen func() // runs after each open, if set
-	fail   error  // returned instead of opening, if set
-	mu     sync.Mutex
-	files  []*os.File
+	fail  error // returned instead of opening, if set
+	mu    sync.Mutex
+	files []*os.File
 }
 
 // trackOpens replaces openSegment until the test ends. Callers must not run in
@@ -1392,10 +1391,6 @@ func trackOpens(t *testing.T) *openTracker {
 		tracker.mu.Lock()
 		tracker.files = append(tracker.files, file)
 		tracker.mu.Unlock()
-
-		if tracker.onOpen != nil {
-			tracker.onOpen()
-		}
 
 		return file, nil
 	}

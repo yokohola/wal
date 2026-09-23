@@ -533,7 +533,7 @@ func TestCreateSegment_RemovesStaleIndex(t *testing.T) {
 	stale := filepath.Join(dir, indexName(5))
 	require.NoError(t, os.WriteFile(stale, encodeIndex(5, segmentOf(4), 9, []indexEntry{{5, segmentHeaderSize}}), 0o644))
 
-	seg, err := createSegment(dir, 5, 0)
+	seg, err := createSegment(dir, 5, segmentOf(4))
 	require.NoError(t, err)
 	require.NoError(t, seg.close())
 	require.NoFileExists(t, stale)

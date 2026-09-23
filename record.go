@@ -217,7 +217,8 @@ func makeIndexCRCTable() *[8]crc32.Table {
 // header rather than an I/O one.
 func isDecodeError(err error) bool {
 	for _, target := range []error{
-		errShortRecord, errBadHeader, errBadData, errShortSegment, errBadSegmentHeader, errMissingRecords,
+		errShortRecord, errBadHeader, errBadData,
+		errShortSegment, errBadSegmentHeader, errMissingRecords,
 	} {
 		if errors.Is(err, target) {
 			return true

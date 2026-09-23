@@ -48,7 +48,8 @@ func readCheckpoint(dir string) (checkpoint, bool, error) {
 	}
 
 	if len(buf) != checkpointSize {
-		return checkpoint{}, false, fmt.Errorf("%w: %s is not %d bytes", ErrCorrupt, path, checkpointSize)
+		return checkpoint{}, false, fmt.Errorf("%w: %s is not %d bytes",
+			ErrCorrupt, path, checkpointSize)
 	}
 
 	if crc32.Checksum(buf[:32], crcTable) != binary.LittleEndian.Uint32(buf[32:]) {
