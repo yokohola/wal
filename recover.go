@@ -36,7 +36,7 @@ func (l *Log) load() error {
 	case len(firsts) == 0 && found:
 		return fmt.Errorf("%w: checkpoint %d but no segments", ErrCorrupt, checkpoint)
 	case len(firsts) == 0:
-		seg, err := createSegment(l.dir, 1, l.opts.SegmentSize)
+		seg, err := createSegment(l.dir, 1, l.cfg.SegmentSize)
 		if err != nil {
 			return err
 		}
@@ -51,7 +51,7 @@ func (l *Log) load() error {
 			checkpoint = 1
 		}
 
-		segments, err = loadSegments(l.dir, firsts, checkpoint, l.opts.SegmentSize)
+		segments, err = loadSegments(l.dir, firsts, checkpoint, l.cfg.SegmentSize)
 		if err != nil {
 			return err
 		}

@@ -1,50 +1,62 @@
 package wal_test
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"os"
+	"os/signal"
+	"time"
 
 	"wal"
 )
 
+// A producer appends and a consumer resumes from the checkpoint after every
+// restart. Open creates the directory when it does not exist.
 func Example() {
-	dir, err := os.MkdirTemp("", "wal")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(dir) }()
-
-	l, err := wal.Open(dir, wal.Options{})
+	l, err := wal.Open("/var/lib/myapp/wal", wal.Config{SyncOnAppend: true})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if _, err := l.Append([]byte("set a"), []byte("set b"), []byte("del a")); err != nil {
+	if _, err := l.Append([]byte("set a"), []byte("set b")); err != nil {
 		log.Fatal(err)
 	}
 
-	// A consumer resumes at the checkpoint and commits past what it handled.
-	recs, err := l.Read(l.Committed(), 2)
-	if err != nil {
-		log.Fatal(err)
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
-	for _, rec := range recs {
-		fmt.Printf("%d %s\n", rec.Index, rec.Data)
+	if err := consume(ctx, l); err != nil {
+		log.Print(err)
 	}
-
-	if err := l.Commit(recs[len(recs)-1].Index + 1); err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("resume at", l.Committed())
 
 	if err := l.Close(); err != nil {
 		log.Fatal(err)
 	}
-	// Output:
-	// 1 set a
-	// 2 set b
-	// resume at 3
+}
+
+func consume(ctx context.Context, l *wal.Log) error {
+	for next := l.Committed(); ctx.Err() == nil; {
+		recs, err := l.Read(next, 1024)
+		if err != nil {
+			return err
+		}
+
+		if len(recs) == 0 {
+			time.Sleep(10 * time.Millisecond)
+
+			continue
+		}
+
+		for _, rec := range recs {
+			log.Printf("apply %d: %s", rec.Index, rec.Data)
+		}
+
+		next = recs[len(recs)-1].Index + 1
+
+		if err := l.Commit(next); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

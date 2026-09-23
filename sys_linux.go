@@ -1,5 +1,3 @@
-//go:build linux
-
 package wal
 
 import (
@@ -12,7 +10,7 @@ import (
 // timestamps. Preallocation keeps the file size fixed, so appends usually
 // need no metadata flush at all.
 func fdatasync(file *os.File) error {
-	if err := control(file, syscall.Fdatasync); err != nil {
+	if err := withFD(file, syscall.Fdatasync); err != nil {
 		return &os.PathError{Op: "fdatasync", Path: file.Name(), Err: err}
 	}
 
@@ -22,7 +20,7 @@ func fdatasync(file *os.File) error {
 // preallocate reserves size bytes so appends do not allocate blocks one by one.
 // Filesystems without fallocate are left alone.
 func preallocate(file *os.File, size int64) error {
-	err := control(file, func(fd int) error {
+	err := withFD(file, func(fd int) error {
 		return syscall.Fallocate(fd, 0, 0, size)
 	})
 	if err == nil || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS) {

@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// DefaultSegmentSize applies when Options.SegmentSize is zero.
+// DefaultSegmentSize applies when Config.SegmentSize is zero.
 const DefaultSegmentSize = 64 << 20
 
 const (
@@ -28,18 +28,18 @@ const (
 
 // Errors reported by a Log, to be matched with errors.Is.
 var (
-	ErrClosed         = errors.New("wal: closed")
-	ErrCorrupt        = errors.New("wal: corrupt")
-	ErrFull           = errors.New("wal: full")
-	ErrInvalidOptions = errors.New("wal: invalid options")
-	ErrLocked         = errors.New("wal: directory locked by another process")
-	ErrOutOfRange     = errors.New("wal: index out of range")
-	ErrTooLarge       = errors.New("wal: batch too large")
+	ErrClosed        = errors.New("wal: closed")
+	ErrCorrupt       = errors.New("wal: corrupt")
+	ErrFull          = errors.New("wal: full")
+	ErrInvalidConfig = errors.New("wal: invalid config")
+	ErrLocked        = errors.New("wal: directory locked by another process")
+	ErrOutOfRange    = errors.New("wal: index out of range")
+	ErrTooLarge      = errors.New("wal: batch too large")
 )
 
-// Options configure a Log. The zero value gives 64 MiB segments, no size cap
+// Config configures a Log. The zero value gives 64 MiB segments, no size cap
 // and fsync only where durability requires it: segment roll, Commit and Close.
-type Options struct {
+type Config struct {
 	// SegmentSize is the size at which the active segment is closed and a new
 	// one started. A batch is never split, so a segment may exceed it by one
 	// batch.
@@ -77,7 +77,7 @@ type Record struct {
 // Committed are durable.
 type Log struct {
 	dir      string
-	opts     Options
+	cfg      Config
 	lock     *os.File
 	syncData func(*os.File) error // fdatasync; tests substitute it
 
@@ -102,12 +102,12 @@ type Log struct {
 // Open opens or creates the log in dir. It repairs what a crash can leave
 // behind and fails with ErrCorrupt on any other damage, or with ErrLocked when
 // another process holds dir. Open reads every retained record to verify it.
-func Open(dir string, opts Options) (*Log, error) {
-	return open(dir, opts, fdatasync)
+func Open(dir string, cfg Config) (*Log, error) {
+	return open(dir, cfg, fdatasync)
 }
 
-func open(dir string, opts Options, syncData func(*os.File) error) (*Log, error) {
-	opts, err := opts.withDefaults()
+func open(dir string, cfg Config, syncData func(*os.File) error) (*Log, error) {
+	cfg, err := cfg.withDefaults()
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +121,7 @@ func open(dir string, opts Options, syncData func(*os.File) error) (*Log, error)
 		return nil, err
 	}
 
-	l := &Log{dir: dir, opts: opts, lock: lock, syncData: syncData}
+	l := &Log{dir: dir, cfg: cfg, lock: lock, syncData: syncData}
 
 	if err := l.load(); err != nil {
 		return nil, errors.Join(err, l.release())
@@ -132,9 +132,9 @@ func open(dir string, opts Options, syncData func(*os.File) error) (*Log, error)
 	return l, nil
 }
 
-func (o Options) withDefaults() (Options, error) {
+func (o Config) withDefaults() (Config, error) {
 	if o.SegmentSize < 0 || o.MaxSize < 0 || o.SyncInterval < 0 {
-		return o, fmt.Errorf("%w: negative value", ErrInvalidOptions)
+		return o, fmt.Errorf("%w: negative value", ErrInvalidConfig)
 	}
 
 	if o.SegmentSize == 0 {
@@ -142,7 +142,7 @@ func (o Options) withDefaults() (Options, error) {
 	}
 
 	if o.MaxSize > 0 && o.MaxSize < o.SegmentSize {
-		return o, fmt.Errorf("%w: MaxSize %d is below SegmentSize %d", ErrInvalidOptions, o.MaxSize, o.SegmentSize)
+		return o, fmt.Errorf("%w: MaxSize %d is below SegmentSize %d", ErrInvalidConfig, o.MaxSize, o.SegmentSize)
 	}
 
 	return o, nil
@@ -374,8 +374,8 @@ func (l *Log) batchSize(data [][]byte) (int64, error) {
 		total += recordHeaderSize + int64(len(rec))
 	}
 
-	if l.opts.MaxSize > 0 && segmentHeaderSize+total > l.opts.MaxSize {
-		return 0, fmt.Errorf("%w: %d bytes never fit MaxSize %d", ErrTooLarge, total, l.opts.MaxSize)
+	if l.cfg.MaxSize > 0 && segmentHeaderSize+total > l.cfg.MaxSize {
+		return 0, fmt.Errorf("%w: %d bytes never fit MaxSize %d", ErrTooLarge, total, l.cfg.MaxSize)
 	}
 
 	return total, nil
@@ -386,20 +386,20 @@ func (l *Log) batchSize(data [][]byte) (int64, error) {
 // space the batch needs. It fails with ErrFull when the batch does not fit.
 func (l *Log) makeRoom(batch int64) error {
 	tail := l.active()
-	roll := tail.count > 0 && tail.size+batch > l.opts.SegmentSize
+	roll := tail.count > 0 && tail.size+batch > l.cfg.SegmentSize
 
-	if l.opts.MaxSize > 0 {
+	if l.cfg.MaxSize > 0 {
 		after := l.size + batch
 		if roll {
 			after += segmentHeaderSize
 		}
 
-		if after > l.opts.MaxSize && tail.count > 0 && tail.nextIndex() == l.committed {
+		if after > l.cfg.MaxSize && tail.count > 0 && tail.nextIndex() == l.committed {
 			roll = true
 			after = l.size - tail.size + segmentHeaderSize + batch
 		}
 
-		if after > l.opts.MaxSize {
+		if after > l.cfg.MaxSize {
 			return ErrFull
 		}
 	}
@@ -432,7 +432,7 @@ func (l *Log) write(data [][]byte) (uint64, error) {
 		return 0, l.fail(wrap(err))
 	}
 
-	if l.opts.SyncOnAppend {
+	if l.cfg.SyncOnAppend {
 		if err := l.syncData(tail.file); err != nil {
 			return 0, l.fail(wrap(err))
 		}
@@ -447,7 +447,7 @@ func (l *Log) write(data [][]byte) (uint64, error) {
 	l.size += int64(len(buf))
 	l.mu.Unlock()
 
-	if l.opts.SyncOnAppend {
+	if l.cfg.SyncOnAppend {
 		l.synced = tail.nextIndex()
 	}
 
@@ -463,7 +463,7 @@ func (l *Log) roll() error {
 		return l.fail(err)
 	}
 
-	next, err := createSegment(l.dir, tail.nextIndex(), l.opts.SegmentSize)
+	next, err := createSegment(l.dir, tail.nextIndex(), l.cfg.SegmentSize)
 	if err != nil {
 		return l.fail(err)
 	}
@@ -535,7 +535,7 @@ func (l *Log) release() error {
 }
 
 func (l *Log) startSyncer() {
-	if l.opts.SyncInterval == 0 {
+	if l.cfg.SyncInterval == 0 {
 		return
 	}
 
@@ -550,7 +550,7 @@ func (l *Log) startSyncer() {
 func (l *Log) runSyncer() {
 	defer close(l.syncDone)
 
-	ticker := time.NewTicker(l.opts.SyncInterval)
+	ticker := time.NewTicker(l.cfg.SyncInterval)
 	defer ticker.Stop()
 
 	for {

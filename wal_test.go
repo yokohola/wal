@@ -26,7 +26,7 @@ func TestOpen_FreshDirectory(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "nested", "wal")
-	l := openLog(t, dir, Options{})
+	l := openLog(t, dir, Config{})
 
 	require.Equal(t, uint64(1), l.FirstIndex())
 	require.Equal(t, uint64(0), l.LastIndex())
@@ -35,10 +35,10 @@ func TestOpen_FreshDirectory(t *testing.T) {
 	require.Equal(t, []string{segmentName(1)}, segmentFiles(t, dir))
 }
 
-func TestOpen_RejectsInvalidOptions(t *testing.T) {
+func TestOpen_RejectsInvalidConfig(t *testing.T) {
 	t.Parallel()
 
-	cases := map[string]Options{
+	cases := map[string]Config{
 		"negative segment size":       {SegmentSize: -1},
 		"negative max size":           {MaxSize: -1},
 		"negative sync interval":      {SyncInterval: -time.Second},
@@ -46,12 +46,12 @@ func TestOpen_RejectsInvalidOptions(t *testing.T) {
 		"max size below default":      {MaxSize: DefaultSegmentSize - 1},
 	}
 
-	for name, opts := range cases {
+	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := Open(t.TempDir(), opts)
-			require.ErrorIs(t, err, ErrInvalidOptions)
+			_, err := Open(t.TempDir(), cfg)
+			require.ErrorIs(t, err, ErrInvalidConfig)
 		})
 	}
 }
@@ -60,14 +60,14 @@ func TestOpen_LocksDirectory(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{})
+	l := openLog(t, dir, Config{})
 
-	_, err := Open(dir, Options{})
+	_, err := Open(dir, Config{})
 	require.ErrorIs(t, err, ErrLocked)
 
 	require.NoError(t, l.Close())
 
-	again, err := Open(dir, Options{})
+	again, err := Open(dir, Config{})
 	require.NoError(t, err)
 	require.NoError(t, again.Close())
 }
@@ -75,7 +75,7 @@ func TestOpen_LocksDirectory(t *testing.T) {
 func TestAppend_AssignsConsecutiveIndexes(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Options{})
+	l := openLog(t, t.TempDir(), Config{})
 
 	last, err := l.Append(payload(1))
 	require.NoError(t, err)
@@ -97,7 +97,7 @@ func TestAppend_AssignsConsecutiveIndexes(t *testing.T) {
 func TestAppend_CopiesInput(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Options{})
+	l := openLog(t, t.TempDir(), Config{})
 
 	data := []byte("original")
 	_, err := l.Append(data)
@@ -114,13 +114,13 @@ func TestAppend_AllowsEmptyRecords(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{})
+	l := openLog(t, dir, Config{})
 
 	_, err := l.Append(nil, []byte{}, []byte("x"))
 	require.NoError(t, err)
 	require.NoError(t, l.Close())
 
-	l = openLog(t, dir, Options{})
+	l = openLog(t, dir, Config{})
 
 	recs, err := l.Read(1, 3)
 	require.NoError(t, err)
@@ -134,7 +134,7 @@ func TestAppend_RollsSegments(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentSize: segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4)})
 
 	appendN(t, l, 10)
 
@@ -153,7 +153,7 @@ func TestAppend_BatchLargerThanSegmentGetsOwnSegment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentSize: segmentOf(2)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(2)})
 
 	appendN(t, l, 1)
 
@@ -170,7 +170,7 @@ func TestAppend_RejectsBatchThatNeverFits(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
 	appendN(t, l, 4)
 
 	batch := make([][]byte, 9)
@@ -194,7 +194,7 @@ func TestAppend_RejectsBatchThatNeverFits(t *testing.T) {
 func TestRead_Ranges(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Options{SegmentSize: segmentOf(3)})
+	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(3)})
 	appendN(t, l, 10)
 
 	cases := []struct {
@@ -239,8 +239,8 @@ func TestRead_FromAnyIndex(t *testing.T) {
 	const n = 600
 
 	dir := t.TempDir()
-	opts := Options{SegmentSize: 64 << 10}
-	l := openLog(t, dir, opts)
+	cfg := Config{SegmentSize: 64 << 10}
+	l := openLog(t, dir, cfg)
 
 	want := make([][]byte, n+1)
 	for i := 1; i <= n; i++ {
@@ -267,13 +267,13 @@ func TestRead_FromAnyIndex(t *testing.T) {
 
 	check(l)
 	require.NoError(t, l.Close())
-	check(openLog(t, dir, opts))
+	check(openLog(t, dir, cfg))
 }
 
 func TestRead_ReturnsCallerOwnedData(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Options{})
+	l := openLog(t, t.TempDir(), Config{})
 	appendN(t, l, 2)
 
 	recs, err := l.Read(1, 2)
@@ -288,7 +288,7 @@ func TestRead_ReturnsCallerOwnedData(t *testing.T) {
 func TestRead_RecordsDoNotShareCapacity(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Options{})
+	l := openLog(t, t.TempDir(), Config{})
 	appendN(t, l, 2)
 
 	recs, err := l.Read(1, 2)
@@ -308,7 +308,7 @@ func TestRead_DoesNotWaitForSync(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 
-	l := openLogWith(t, t.TempDir(), Options{SyncOnAppend: true}, func(file *os.File) error {
+	l := openLogWith(t, t.TempDir(), Config{SyncOnAppend: true}, func(file *os.File) error {
 		if blocking.Load() {
 			entered <- struct{}{}
 			<-release
@@ -363,8 +363,8 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	opts := Options{SegmentSize: segmentOf(4)}
-	l := openLog(t, dir, opts)
+	cfg := Config{SegmentSize: segmentOf(4)}
+	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 
 	require.NoError(t, l.Commit(6))
@@ -385,7 +385,7 @@ func TestCommit_PersistsAndReclaims(t *testing.T) {
 
 	require.NoError(t, l.Close())
 
-	l = openLog(t, dir, opts)
+	l = openLog(t, dir, cfg)
 	require.Equal(t, uint64(11), l.Committed())
 	require.Equal(t, uint64(9), l.FirstIndex())
 	require.Equal(t, uint64(10), l.LastIndex())
@@ -399,7 +399,7 @@ func TestCommit_SyncsRecordsBeforeCheckpoint(t *testing.T) {
 	// Each sync records the checkpoint on disk at that moment.
 	var seen []uint64
 
-	l := openLogWith(t, dir, Options{}, func(file *os.File) error {
+	l := openLogWith(t, dir, Config{}, func(file *os.File) error {
 		index, _, err := readCheckpoint(dir)
 		require.NoError(t, err)
 
@@ -424,7 +424,7 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentSize: segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4)})
 	appendN(t, l, 10)
 
 	// A non-empty directory in place of the first segment makes its removal fail.
@@ -448,7 +448,7 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 func TestMaxSize_AppliesBackpressure(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Options{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
+	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
 	appendN(t, l, 7)
 
 	_, err := l.Append(payload(8), payload(9))
@@ -464,7 +464,7 @@ func TestMaxSize_RollsAwayCommittedActiveSegment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
 
 	// One batch fills the active segment far past SegmentSize.
 	batch := make([][]byte, 8)
@@ -495,7 +495,7 @@ func TestSync_OnAppend(t *testing.T) {
 
 	var calls atomic.Int64
 
-	l := openLogWith(t, t.TempDir(), Options{SyncOnAppend: true}, countingSync(&calls))
+	l := openLogWith(t, t.TempDir(), Config{SyncOnAppend: true}, countingSync(&calls))
 
 	appendN(t, l, 3)
 	require.Equal(t, int64(3), calls.Load())
@@ -511,7 +511,7 @@ func TestSync_OnDemand(t *testing.T) {
 
 	var calls atomic.Int64
 
-	l := openLogWith(t, t.TempDir(), Options{}, countingSync(&calls))
+	l := openLogWith(t, t.TempDir(), Config{}, countingSync(&calls))
 
 	appendN(t, l, 3)
 	require.Zero(t, calls.Load())
@@ -530,7 +530,7 @@ func TestSync_InBackground(t *testing.T) {
 
 	var calls atomic.Int64
 
-	l := openLogWith(t, t.TempDir(), Options{SyncInterval: time.Millisecond}, countingSync(&calls))
+	l := openLogWith(t, t.TempDir(), Config{SyncInterval: time.Millisecond}, countingSync(&calls))
 	appendN(t, l, 3)
 
 	require.Eventually(t, func() bool { return calls.Load() > 0 }, 5*time.Second, time.Millisecond)
@@ -547,7 +547,7 @@ func TestSync_InBackground(t *testing.T) {
 func TestClose_RejectsFurtherUse(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Options{})
+	l := openLog(t, t.TempDir(), Config{})
 	appendN(t, l, 2)
 	require.NoError(t, l.Close())
 
@@ -573,9 +573,9 @@ func TestFailure_IsSticky(t *testing.T) {
 
 	injected := errors.New("injected fsync failure")
 	dir := t.TempDir()
-	opts := Options{SyncOnAppend: true, SegmentSize: segmentOf(2)}
+	cfg := Config{SyncOnAppend: true, SegmentSize: segmentOf(2)}
 
-	l := openLogWith(t, dir, opts, func(file *os.File) error {
+	l := openLogWith(t, dir, cfg, func(file *os.File) error {
 		if failing.Load() {
 			return injected
 		}
@@ -601,7 +601,7 @@ func TestFailure_IsSticky(t *testing.T) {
 	require.ErrorIs(t, l.Close(), injected)
 
 	// The write reached the file before the fsync failed, so it is found again.
-	l = openLog(t, dir, opts)
+	l = openLog(t, dir, cfg)
 	requireRecords(t, readAll(t, l), 1, 4)
 }
 
@@ -614,7 +614,7 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 		total     = writers * perWriter
 	)
 
-	l := openLog(t, t.TempDir(), Options{SegmentSize: 4096, SyncInterval: time.Millisecond})
+	l := openLog(t, t.TempDir(), Config{SegmentSize: 4096, SyncInterval: time.Millisecond})
 
 	var wg sync.WaitGroup
 
@@ -748,16 +748,16 @@ func segmentOf(n int) int64 {
 	return segmentHeaderSize + int64(n)*testRecordSize
 }
 
-func openLog(t *testing.T, dir string, opts Options) *Log {
+func openLog(t *testing.T, dir string, cfg Config) *Log {
 	t.Helper()
 
-	return openLogWith(t, dir, opts, fdatasync)
+	return openLogWith(t, dir, cfg, fdatasync)
 }
 
-func openLogWith(t *testing.T, dir string, opts Options, syncData func(*os.File) error) *Log {
+func openLogWith(t *testing.T, dir string, cfg Config, syncData func(*os.File) error) *Log {
 	t.Helper()
 
-	l, err := open(dir, opts, syncData)
+	l, err := open(dir, cfg, syncData)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -772,7 +772,7 @@ func openLogWith(t *testing.T, dir string, opts Options, syncData func(*os.File)
 func openBench(b *testing.B) *Log {
 	b.Helper()
 
-	l, err := Open(b.TempDir(), Options{})
+	l, err := Open(b.TempDir(), Config{})
 	if err != nil {
 		b.Fatal(err)
 	}

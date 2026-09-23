@@ -13,15 +13,15 @@ func TestReopen_RestoresState(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	opts := Options{SegmentSize: segmentOf(4)}
+	cfg := Config{SegmentSize: segmentOf(4)}
 
-	l := openLog(t, dir, opts)
+	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Commit(3))
 	size := l.Size()
 	require.NoError(t, l.Close())
 
-	l = openLog(t, dir, opts)
+	l = openLog(t, dir, cfg)
 	require.Equal(t, uint64(1), l.FirstIndex())
 	require.Equal(t, uint64(10), l.LastIndex())
 	require.Equal(t, uint64(3), l.Committed())
@@ -50,20 +50,20 @@ func TestReopen_CutsTornTail(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			l := openLog(t, dir, Options{})
+			l := openLog(t, dir, Config{})
 			appendN(t, l, 3)
 			require.NoError(t, l.Close())
 
 			appendBytes(t, filepath.Join(dir, segmentName(1)), tail)
 
-			l = openLog(t, dir, Options{})
+			l = openLog(t, dir, Config{})
 			require.Equal(t, uint64(3), l.LastIndex())
 			require.Equal(t, segmentOf(3), l.Size())
 
 			appendN(t, l, 2)
 			require.NoError(t, l.Close())
 
-			l = openLog(t, dir, Options{})
+			l = openLog(t, dir, Config{})
 			requireRecords(t, readAll(t, l), 1, 5)
 		})
 	}
@@ -94,7 +94,7 @@ func TestReopen_CutsRecordWithUnwrittenSector(t *testing.T) {
 			path := writeSegment(t, dir, 1, data, data, data)
 			zeroRange(t, path, tc.from, tc.to)
 
-			l := openLog(t, dir, Options{})
+			l := openLog(t, dir, Config{})
 			require.Equal(t, uint64(1), l.LastIndex())
 
 			appendN(t, l, 1)
@@ -122,7 +122,7 @@ func TestReopen_EveryCutKeepsAPrefix(t *testing.T) {
 		cutDir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(cutDir, segmentName(1)), full[:cut], 0o644))
 
-		l, err := Open(cutDir, Options{})
+		l, err := Open(cutDir, Config{})
 		require.NoError(t, err, "cut at %d", cut)
 
 		kept := (cut - segmentHeaderSize) / testRecordSize
@@ -151,7 +151,7 @@ func TestReopen_EveryFlippedByteInActiveSegmentIsCorrupt(t *testing.T) {
 		flipDir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(flipDir, segmentName(1)), flipped(full, offset), 0o644))
 
-		_, err := Open(flipDir, Options{})
+		_, err := Open(flipDir, Config{})
 		require.ErrorIs(t, err, ErrCorrupt, "flip at %d", offset)
 	}
 }
@@ -286,15 +286,15 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			opts := Options{SegmentSize: segmentOf(4)}
-			l := openLog(t, dir, opts)
+			cfg := Config{SegmentSize: segmentOf(4)}
+			l := openLog(t, dir, cfg)
 			appendN(t, l, 10)
 			require.NoError(t, l.Commit(2))
 			require.NoError(t, l.Close())
 
 			tc.damage(t, dir)
 
-			_, err := Open(dir, opts)
+			_, err := Open(dir, cfg)
 			require.ErrorIs(t, err, ErrCorrupt)
 			require.ErrorContains(t, err, tc.reason)
 		})
@@ -305,15 +305,15 @@ func TestReopen_FailureDeletesNothing(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	opts := Options{SegmentSize: segmentOf(4)}
-	l := openLog(t, dir, opts)
+	cfg := Config{SegmentSize: segmentOf(4)}
+	l := openLog(t, dir, cfg)
 	appendN(t, l, 10)
 	require.NoError(t, l.Close())
 
 	// This checkpoint covers every segment but claims records that never existed.
 	require.NoError(t, writeCheckpoint(dir, 50))
 
-	_, err := Open(dir, opts)
+	_, err := Open(dir, cfg)
 	require.ErrorIs(t, err, ErrCorrupt)
 	require.Equal(t, []string{segmentName(1), segmentName(5), segmentName(9)}, segmentFiles(t, dir))
 }
@@ -334,8 +334,8 @@ func TestReopen_DeletesSegmentsLeftBelowCheckpoint(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			opts := Options{SegmentSize: segmentOf(4)}
-			l := openLog(t, dir, opts)
+			cfg := Config{SegmentSize: segmentOf(4)}
+			l := openLog(t, dir, cfg)
 			appendN(t, l, 10)
 			require.NoError(t, l.Close())
 
@@ -345,7 +345,7 @@ func TestReopen_DeletesSegmentsLeftBelowCheckpoint(t *testing.T) {
 				require.NoError(t, os.Remove(filepath.Join(dir, segmentName(first))))
 			}
 
-			l = openLog(t, dir, opts)
+			l = openLog(t, dir, cfg)
 			require.Equal(t, uint64(9), l.Committed())
 			require.Equal(t, uint64(9), l.FirstIndex())
 			require.Equal(t, []string{segmentName(9)}, segmentFiles(t, dir))
@@ -364,7 +364,7 @@ func TestReopen_DeletesCommittedSegmentBeforeEmptyActive(t *testing.T) {
 	writeSegment(t, dir, 4)
 	require.NoError(t, writeCheckpoint(dir, 4))
 
-	l := openLog(t, dir, Options{})
+	l := openLog(t, dir, Config{})
 	require.Equal(t, uint64(4), l.FirstIndex())
 	require.Equal(t, uint64(3), l.LastIndex())
 	require.Equal(t, []string{segmentName(4)}, segmentFiles(t, dir))
@@ -377,7 +377,7 @@ func TestReopen_RemovesOnlyOwnTempFiles(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{})
+	l := openLog(t, dir, Config{})
 	appendN(t, l, 1)
 	require.NoError(t, l.Close())
 
@@ -388,7 +388,7 @@ func TestReopen_RemovesOnlyOwnTempFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0o644))
 	}
 
-	l = openLog(t, dir, Options{})
+	l = openLog(t, dir, Config{})
 	requireRecords(t, readAll(t, l), 1, 1)
 
 	for _, name := range own {

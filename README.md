@@ -5,12 +5,12 @@ indexes starting at 1. A consumer reads from any retained index, keeps its own
 position and commits what it is done with; segments holding only committed
 records are deleted.
 
-Standard library only. Unix only: the directory lock uses `flock`.
+Standard library only. Built for Linux; macOS works for development.
 
 ## Usage
 
 ```go
-l, err := wal.Open("/data/shard-1/wal", wal.Options{})
+l, err := wal.Open("/data/shard-1/wal", wal.Config{})
 if err != nil {
 	return err
 }
