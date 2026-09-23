@@ -43,9 +43,8 @@ type segment struct {
 	sparseIndex []indexEntry // one entry per sparseInterval bytes or so
 	file        *os.File     // open while the segment is active
 
-	// Open trusts the bytes up to trustedEnd to hold the records below
-	// trustedNext without reading them. The first read verifies and indexes
-	// them; until then sparseIndex covers only what follows.
+	// Bytes up to trustedEnd hold the records below trustedNext, unread by Open.
+	// The first read verifies and indexes them.
 	trustedEnd  int64
 	trustedNext uint64
 	verified    bool
@@ -140,9 +139,10 @@ func (s *segment) addRecord(size int64) {
 
 // position returns the nearest indexed record at or before index and its offset.
 func (s *segment) position(index uint64) (uint64, int64) {
-	i, found := slices.BinarySearchFunc(s.sparseIndex, index, func(entry indexEntry, target uint64) int {
-		return cmp.Compare(entry.index, target)
-	})
+	i, found := slices.BinarySearchFunc(s.sparseIndex, index,
+		func(entry indexEntry, target uint64) int {
+			return cmp.Compare(entry.index, target)
+		})
 	if !found {
 		i--
 	}

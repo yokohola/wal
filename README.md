@@ -27,8 +27,8 @@ err = l.Commit(recs[len(recs)-1].Index) // last processed index
 
 - `Append` writes a batch as consecutive records, visible to `Read` once it
   returns. A crash can keep any prefix of the batch. `ErrFull` means the batch
-  does not fit `MaxSize` until more is committed; `ErrTooLarge` means it never
-  will, or a record exceeds `MaxRecordSize` (1 MiB by default). Keep large
+  does not fit `MaxWALSize` until more is committed; `ErrTooLarge` means it
+  never will, or a record exceeds `MaxRecordSize` (1 MiB by default). Keep large
   payloads outside the log and append a reference to them.
 - `Read(from, limit)` is stateless. `from` must lie in
   `[FirstIndex, LastIndex+1]`; at `LastIndex+1` the result is empty.
@@ -45,7 +45,7 @@ err = l.Commit(recs[len(recs)-1].Index) // last processed index
 - After a failed write or fsync the log refuses `Append`, `Commit` and `Sync`
   with that error. Reads keep working. Reopen to recover; the failed batch may
   then be present.
-- `Size` and `MaxSize` count retained bytes. On Linux the active segment is
+- `Size` and `MaxWALSize` count retained bytes. On Linux the active segment is
   preallocated, so it can take up to `SegmentSize` on disk while it fills.
 - One process per directory, enforced with `flock`.
 

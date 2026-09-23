@@ -16,11 +16,9 @@ const sectorSize = 512
 
 var zeroSector [sectorSize]byte
 
-// load rebuilds the log from its directory. It deletes temp files and committed
-// segments a crash left behind and cuts a torn tail off the active segment. Any
-// other inconsistency it reads is ErrCorrupt. Only what follows the checkpoint
-// is read; the rest is verified by the first read that touches it.
-func (l *Log) load() error { // todo: log point in different file, needed poolishing and refactoring for the whole project
+// load rebuilds the log from its directory, reading only what follows the
+// checkpoint. It removes what a crash left behind; anything else is ErrCorrupt.
+func (l *Log) load() error {
 	firsts, err := listSegments(l.dir)
 	if err != nil {
 		return err
@@ -99,10 +97,8 @@ func listSegments(dir string) ([]uint64, error) {
 	return firsts, nil
 }
 
-// loadSegments validates the segments named by firsts against the checkpoint
-// and opens the last one for appending. Segments holding only committed records
-// are skipped and deleted once the rest is valid: a crash after the checkpoint
-// is written can leave any of them, so gaps there are no damage.
+// loadSegments validates segments against the checkpoint and opens the last.
+// Fully committed ones, gaps included, are deleted once the rest is valid.
 func loadSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([]*segment, error) {
 	live := firsts
 	for len(live) > 1 && live[1] <= cp.committed+1 {
@@ -117,7 +113,8 @@ func loadSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([
 	}
 
 	if cp.segment >= live[0] && !slices.Contains(live, cp.segment) {
-		return nil, fmt.Errorf("%w: checkpoint names segment %d, which is missing", ErrCorrupt, cp.segment)
+		return nil, fmt.Errorf("%w: checkpoint names segment %d, which is missing",
+			ErrCorrupt, cp.segment)
 	}
 
 	segments, err := openSegments(dir, live, cp, prealloc)
@@ -128,7 +125,8 @@ func loadSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([
 	active := segments[len(segments)-1]
 	if cp.committed >= active.nextIndex() {
 		return nil, errors.Join(
-			fmt.Errorf("%w: checkpoint %d is past the last record %d", ErrCorrupt, cp.committed, active.nextIndex()-1),
+			fmt.Errorf("%w: checkpoint %d is past the last record %d",
+				ErrCorrupt, cp.committed, active.nextIndex()-1),
 			active.close())
 	}
 
@@ -163,9 +161,8 @@ func openSegments(dir string, firsts []uint64, cp checkpoint, prealloc int64) ([
 	return append(segments, active), nil
 }
 
-// trustClosedSegment accepts a segment unread. It was sealed before the next
-// one was created, so a crash cannot have torn it, and its records end where
-// the next segment starts.
+// trustClosedSegment accepts a segment unread: it was sealed before the next
+// one was created, so a crash cannot have torn it.
 func trustClosedSegment(dir string, first, next uint64) (*segment, error) {
 	seg := newSegment(dir, first)
 
@@ -179,11 +176,11 @@ func trustClosedSegment(dir string, first, next uint64) (*segment, error) {
 	return seg, nil
 }
 
-// recoverActiveSegment opens the last segment for appending. It trusts what the
-// checkpoint marks durable and scans the rest. A torn tail is truncated and the
-// file synced before any append, so new records never land in front of stale
-// bytes that a later crash could expose.
-func recoverActiveSegment(dir string, first uint64, cp checkpoint, prealloc int64) (*segment, error) {
+// recoverActiveSegment opens the last segment for appending, scanning only past
+// the checkpoint. A torn tail is truncated and synced before any append.
+func recoverActiveSegment(
+	dir string, first uint64, cp checkpoint, prealloc int64,
+) (*segment, error) {
 	seg := newSegment(dir, first)
 
 	file, err := os.OpenFile(seg.path, os.O_RDWR, 0)
@@ -250,9 +247,8 @@ func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc in
 	return nil
 }
 
-// isTornRecord reports whether the record at offset, which failed to decode
-// with decodeErr, is a write cut short by a crash rather than damaged data. A
-// cut write runs past the end of the file or has a sector that reads as zeros.
+// isTornRecord reports whether a record that failed to decode was cut short by a
+// crash: it runs past the file end or has a sector that reads as zeros.
 func isTornRecord(file *os.File, offset int64, decodeErr error) (bool, error) {
 	if errors.Is(decodeErr, errShortRecord) {
 		return true, nil

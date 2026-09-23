@@ -11,17 +11,15 @@ import (
 	"path/filepath"
 )
 
-// The checkpoint file holds the committed index, the durable end of the active
-// segment and a CRC32C of them. It is replaced through a temp file and a
-// rename, so it is the old or the new one.
+// The checkpoint file holds the committed index, the active segment's durable
+// end and their CRC32C. A temp file and rename make replacing it atomic.
 const (
 	checkpointName = "checkpoint"
 	checkpointSize = 36
 )
 
-// checkpoint is the durable state Open starts from. Segment names the segment
-// that was active when it was written; its bytes up to end hold the records
-// below next, and they were durable before the checkpoint was.
+// checkpoint is the durable state Open starts from: segment's bytes up to end
+// hold the records below next, durable before the checkpoint was written.
 type checkpoint struct {
 	committed uint64
 	segment   uint64

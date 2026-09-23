@@ -35,14 +35,14 @@ still hold `limit` × MaxRecordSize.
 Problem: a batch is never split, so one large batch makes its segment far
 larger than SegmentSize, and `reclaim` frees it only when fully committed.
 
-Note: MaxRecordSize does not bound the overshoot; only MaxSize bounds a batch.
-Splitting a batch at a roll would publish part of a batch before Append
+Note: MaxRecordSize does not bound the overshoot; only MaxWALSize bounds a
+batch. Splitting a batch at a roll would publish part of a batch before Append
 succeeds, unless new segments are staged unpublished.
 
 ## Decisions
 
 - CRC32C stays mandatory. It is part of the format and recovery depends on it.
-- Not planned: retryable ENOSPC at segment roll, a default MaxSize or retention
-  independent of Commit, incremental CRC during recovery.
+- Not planned: retryable ENOSPC at segment roll, a default MaxWALSize or
+  retention independent of Commit, incremental CRC during recovery.
 - No blocking Wait for consumers. Read returns empty at the end; the consumer
   decides how to wait.

@@ -39,13 +39,13 @@ func TestOpen_RejectsInvalidConfig(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]Config{
-		"negative segment size":       {SegmentSize: -1},
-		"negative max size":           {MaxSize: -1},
-		"negative max record size":    {MaxRecordSize: -1},
-		"record size above format":    {MaxRecordSize: math.MaxUint32 + 1},
-		"negative sync interval":      {SyncInterval: -time.Second},
-		"max size below segment size": {SegmentSize: 1024, MaxSize: 1023},
-		"max size below default":      {MaxSize: DefaultSegmentSize - 1},
+		"negative segment size":           {SegmentSize: -1},
+		"negative max wal size":           {MaxWALSize: -1},
+		"negative max record size":        {MaxRecordSize: -1},
+		"record size above format":        {MaxRecordSize: math.MaxUint32 + 1},
+		"negative sync interval":          {SyncInterval: -time.Second},
+		"max wal size below segment size": {SegmentSize: 1024, MaxWALSize: 1023},
+		"max wal size below default":      {MaxWALSize: DefaultSegmentSize - 1},
 	}
 
 	for name, cfg := range cases {
@@ -172,7 +172,7 @@ func TestAppend_RejectsBatchThatNeverFits(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxWALSize: 2 * segmentOf(4)})
 	appendN(t, l, 4)
 
 	batch := make([][]byte, 9)
@@ -493,7 +493,7 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 func TestMaxSize_AppliesBackpressure(t *testing.T) {
 	t.Parallel()
 
-	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
+	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(4), MaxWALSize: 2 * segmentOf(4)})
 	appendN(t, l, 7)
 
 	_, err := l.Append(payload(8), payload(9))
@@ -509,7 +509,7 @@ func TestMaxSize_RollsAwayCommittedActiveSegment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxSize: 2 * segmentOf(4)})
+	l := openLog(t, dir, Config{SegmentSize: segmentOf(4), MaxWALSize: 2 * segmentOf(4)})
 
 	// One batch fills the active segment far past SegmentSize.
 	batch := make([][]byte, 8)
@@ -636,7 +636,7 @@ func TestAppend_GroupKeepsPerBatchOutcome(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: segmentOf(2), MaxSize: 2 * segmentOf(2)}
+	cfg := Config{SegmentSize: segmentOf(2), MaxWALSize: 2 * segmentOf(2)}
 	l := openLog(t, dir, cfg)
 	appendN(t, l, 1)
 
