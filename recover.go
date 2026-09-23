@@ -155,7 +155,7 @@ func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc in
 	}
 
 	if err := seg.checkHeader(file); err != nil {
-		return err
+		return seg.recordError(0, err)
 	}
 
 	if cp.segment == seg.first {

@@ -2,6 +2,8 @@ package wal
 
 import (
 	"bytes"
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -165,42 +167,17 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 		return filepath.Join(dir, segmentName(first))
 	}
 
-	// Damage in data the checkpoint trusts surfaces on the first Read of it.
+	// Damage in data the checkpoint trusts surfaces on Read instead.
 	cases := map[string]struct {
 		damage func(t *testing.T, dir string)
 		reason string
-		onRead bool
 	}{
-		"flipped record in closed segment": {
-			damage: func(t *testing.T, dir string) {
-				t.Helper()
-				flipByte(t, path(dir, 1), segmentHeaderSize+recordHeaderSize+2)
-			},
-			reason: "data checksum mismatch",
-			onRead: true,
-		},
-		"flipped record in active segment": {
-			damage: func(t *testing.T, dir string) {
-				t.Helper()
-				flipByte(t, path(dir, 9), segmentHeaderSize+recordHeaderSize+2)
-			},
-			reason: "data checksum mismatch",
-			onRead: true,
-		},
-		"bad magic in closed segment": {
-			damage: func(t *testing.T, dir string) {
-				t.Helper()
-				flipByte(t, path(dir, 1), 0)
-			},
-			reason: "bad header",
-			onRead: true,
-		},
 		"bad magic in active segment": {
 			damage: func(t *testing.T, dir string) {
 				t.Helper()
 				flipByte(t, path(dir, 9), 1)
 			},
-			reason: "bad header",
+			reason: "bad segment header",
 		},
 		"segment under another name": {
 			damage: func(t *testing.T, dir string) {
@@ -209,7 +186,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				require.NoError(t, err)
 				require.NoError(t, os.WriteFile(path(dir, 9), data, 0o644))
 			},
-			reason: "bad header",
+			reason: "bad segment header",
 		},
 		"active segment shorter than header": {
 			damage: func(t *testing.T, dir string) {
@@ -217,38 +194,6 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 				require.NoError(t, os.Truncate(path(dir, 9), segmentHeaderSize-1))
 			},
 			reason: "shorter than a segment header",
-		},
-		"bytes after closed segment": {
-			damage: func(t *testing.T, dir string) {
-				t.Helper()
-				appendBytes(t, path(dir, 1), []byte("garbage"))
-			},
-			reason: "runs past the end",
-			onRead: true,
-		},
-		"zeros after closed segment": {
-			damage: func(t *testing.T, dir string) {
-				t.Helper()
-				appendBytes(t, path(dir, 1), make([]byte, 100))
-			},
-			reason: "header checksum mismatch",
-			onRead: true,
-		},
-		"truncated closed segment": {
-			damage: func(t *testing.T, dir string) {
-				t.Helper()
-				require.NoError(t, os.Truncate(path(dir, 1), segmentOf(4)-3))
-			},
-			reason: "runs past the end",
-			onRead: true,
-		},
-		"missing middle segment": {
-			damage: func(t *testing.T, dir string) {
-				t.Helper()
-				require.NoError(t, os.Remove(path(dir, 5)))
-			},
-			reason: "ends at index 4 but should end at 8",
-			onRead: true,
 		},
 		"corrupt checkpoint": {
 			damage: func(t *testing.T, dir string) {
@@ -347,14 +292,7 @@ func TestReopen_DetectsCorruption(t *testing.T) {
 
 			tc.damage(t, dir)
 
-			l, err := Open(dir, cfg)
-			if tc.onRead {
-				require.NoError(t, err)
-				t.Cleanup(func() { require.NoError(t, l.Close()) })
-
-				_, err = l.Read(l.FirstIndex(), 100)
-			}
-
+			_, err := Open(dir, cfg)
 			require.ErrorIs(t, err, ErrCorrupt)
 			require.ErrorContains(t, err, tc.reason)
 		})
@@ -649,7 +587,291 @@ func TestRead_SegmentReclaimedDuringVerification(t *testing.T) {
 	require.ErrorIs(t, <-read, ErrOutOfRange)
 }
 
-func TestRead_ReportsDamageForGood(t *testing.T) {
+// Damage in trusted records fails only the records it makes unreadable. Records
+// before it come back as a short result and records after it read normally.
+func TestRead_ReportsLostTrustedRecords(t *testing.T) {
+	t.Parallel()
+
+	// The log holds segments 1, 5 and 9 with records 1 to 10, all trusted.
+	path := func(dir string, first uint64) string {
+		return filepath.Join(dir, segmentName(first))
+	}
+
+	// recordAt is the offset of record index in its segment.
+	recordAt := func(index, first uint64) int64 {
+		return segmentOf(int(index - first))
+	}
+
+	cases := map[string]struct {
+		damage      func(t *testing.T, dir string)
+		segment     uint64
+		offset      int64
+		first, last uint64
+		reason      string
+	}{
+		"bad data in closed segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				flipByte(t, path(dir, 1), recordAt(2, 1)+recordHeaderSize+2)
+			},
+			segment: 1, offset: recordAt(2, 1), first: 2, last: 2,
+			reason: "data checksum mismatch",
+		},
+		"bad data in active segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				flipByte(t, path(dir, 9), recordAt(9, 9)+recordHeaderSize)
+			},
+			segment: 9, offset: recordAt(9, 9), first: 9, last: 9,
+			reason: "data checksum mismatch",
+		},
+		"bad record header in closed segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				flipByte(t, path(dir, 5), recordAt(6, 5))
+			},
+			segment: 5, offset: recordAt(6, 5), first: 6, last: 8,
+			reason: "header checksum mismatch",
+		},
+		"bad record header in active segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				flipByte(t, path(dir, 9), recordAt(9, 9)+recordHeaderSize-1)
+			},
+			segment: 9, offset: recordAt(9, 9), first: 9, last: 10,
+			reason: "header checksum mismatch",
+		},
+		"bad magic in closed segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				flipByte(t, path(dir, 5), 0)
+			},
+			segment: 5, offset: segmentHeaderSize, first: 5, last: 8,
+			reason: "bad segment header",
+		},
+		"closed segment shorter than header": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, os.Truncate(path(dir, 5), segmentHeaderSize-1))
+			},
+			segment: 5, offset: segmentHeaderSize, first: 5, last: 8,
+			reason: "shorter than a segment header",
+		},
+		"closed segment cut inside a record": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, os.Truncate(path(dir, 1), segmentOf(4)-3))
+			},
+			segment: 1, offset: recordAt(4, 1), first: 4, last: 4,
+			reason: "runs past the end",
+		},
+		"closed segment cut between records": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, os.Truncate(path(dir, 1), segmentOf(2)))
+			},
+			segment: 1, offset: recordAt(3, 1), first: 3, last: 4,
+			reason: "segment ends before its last record",
+		},
+		"missing middle segment": {
+			damage: func(t *testing.T, dir string) {
+				t.Helper()
+				require.NoError(t, os.Remove(path(dir, 5)))
+			},
+			segment: 1, offset: segmentOf(4), first: 5, last: 8,
+			reason: "segment ends before its last record",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			cfg := Config{SegmentSize: segmentOf(4)}
+			l := openLog(t, dir, cfg)
+			appendN(t, l, 10)
+			require.NoError(t, l.Close())
+
+			tc.damage(t, dir)
+
+			l = openLog(t, dir, cfg)
+
+			recs, err := l.Read(1, 100)
+			if tc.first == 1 {
+				require.ErrorIs(t, err, ErrCorrupt)
+			} else {
+				require.NoError(t, err)
+				requireRecords(t, recs, 1, int(tc.first-1))
+			}
+
+			for from := tc.first; from <= tc.last; from++ {
+				_, err := l.Read(from, 100)
+				require.ErrorIs(t, err, ErrCorrupt)
+				require.ErrorContains(t, err, tc.reason)
+
+				var lost *CorruptError
+				require.ErrorAs(t, err, &lost)
+				require.Equal(t, CorruptError{
+					Path:   path(dir, tc.segment),
+					Offset: tc.offset,
+					First:  tc.first,
+					Last:   tc.last,
+					Err:    lost.Err,
+				}, *lost)
+			}
+
+			recs, err = l.Read(tc.last+1, 100)
+			require.NoError(t, err)
+			requireRecords(t, recs, tc.last+1, int(10-tc.last))
+
+			appendN(t, l, 1)
+			recs, err = l.Read(tc.last+1, 100)
+			require.NoError(t, err)
+			requireRecords(t, recs, tc.last+1, int(11-tc.last))
+		})
+	}
+}
+
+// Flipping any byte of a trusted segment loses exactly the records it covers:
+// one record for its data, the rest of the segment for a header. No Read ever
+// returns a record under a wrong index. Open checks the active segment's header
+// itself.
+func TestRead_EveryFlippedTrustedByteLosesItsRange(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4)}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 10)
+	require.NoError(t, l.Close())
+
+	for _, first := range []uint64{5, 9} {
+		last := min(first+3, 10)
+
+		for offset := range segmentOf(int(last - first + 1)) {
+			damaged := snapshot(t, dir)
+			flipByte(t, filepath.Join(damaged, segmentName(first)), offset)
+
+			active := first == 9
+			if active && offset < segmentHeaderSize {
+				_, err := Open(damaged, cfg)
+				require.ErrorContains(t, err, "bad segment header")
+
+				continue
+			}
+
+			l := openLog(t, damaged, cfg)
+			appendN(t, l, 1)
+
+			want := lostRange(first, last)
+			if offset >= segmentHeaderSize {
+				index := first + uint64((offset-segmentHeaderSize)/testRecordSize)
+				want = lostRange(index, last)
+
+				if (offset-segmentHeaderSize)%testRecordSize >= recordHeaderSize {
+					want = lostRange(index, index)
+				}
+			}
+
+			require.Equal(t, want, lostIndexes(t, l), "segment %d, flip at %d", first, offset)
+			require.NoError(t, l.Close())
+		}
+	}
+}
+
+// Records this process wrote are checked on every Read. A bad header loses the
+// records up to the next one the sparse index locates.
+func TestRead_ReportsLostWrittenRecords(t *testing.T) {
+	t.Parallel()
+
+	const n = 600
+
+	l := openLog(t, t.TempDir(), Config{})
+	appendN(t, l, n)
+
+	seg := l.segments[0]
+	require.Greater(t, len(seg.sparseIndex), 3)
+	entry := seg.sparseIndex[2]
+
+	cases := map[string]struct {
+		index       uint64
+		offset      int64 // within the record
+		first, last uint64
+	}{
+		"bad data":                     {index: 50, offset: recordHeaderSize + 1, first: 50, last: 50},
+		"bad data at indexed record":   {index: entry.index, offset: recordHeaderSize, first: entry.index, last: entry.index},
+		"bad header":                   {index: 50, offset: 0, first: 50, last: seg.sparseIndex[1].index - 1},
+		"bad header at indexed record": {index: entry.index, offset: 4, first: entry.index, last: seg.sparseIndex[3].index - 1},
+		"bad header before indexed record": {
+			index: entry.index - 1, offset: 8, first: entry.index - 1, last: entry.index - 1,
+		},
+		"bad header of last record": {index: n, offset: 0, first: n, last: n},
+	}
+
+	for name, tc := range cases {
+		offset := segmentOf(int(tc.index-1)) + tc.offset
+		flipByte(t, seg.path, offset)
+
+		want := lostRange(tc.first, tc.last)
+		require.Equal(t, want, lostIndexes(t, l), name)
+
+		_, err := l.Read(tc.first, 1)
+
+		var lost *CorruptError
+		require.ErrorAs(t, err, &lost, name)
+		require.Equal(t, segmentOf(int(tc.first-1)), lost.Offset, name)
+		require.Equal(t, seg.path, lost.Path, name)
+
+		flipByte(t, seg.path, offset)
+		require.Empty(t, lostIndexes(t, l), "%s: restored", name)
+	}
+}
+
+// Verification can find fewer or more trusted records than the checkpoint
+// claims. Reads keep the records past the trusted bytes apart from them, so
+// neither shifts their indexes.
+func TestRead_TrustedRecordsDoNotShiftLaterOnes(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		claimed int // trusted records the checkpoint claims; 4 are on disk
+		lost    []uint64
+	}{
+		"fewer on disk": {claimed: 5, lost: []uint64{5}},
+		"more on disk":  {claimed: 3},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			writeSegment(t, dir, 1, payload(1), payload(2), payload(3), payload(4))
+			require.NoError(t, writeCheckpoint(dir, checkpoint{
+				segment: 1, end: segmentOf(4), next: uint64(tc.claimed) + 1,
+			}))
+
+			l := openLog(t, dir, Config{})
+			require.Equal(t, uint64(tc.claimed), l.LastIndex())
+
+			// The first Read verifies the segment before anything follows the trusted
+			// bytes; the appended records must still be found.
+			require.Equal(t, tc.lost, lostIndexes(t, l))
+
+			for range 200 {
+				_, err := l.Append(payload(l.LastIndex() + 1))
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tc.lost, lostIndexes(t, l))
+		})
+	}
+}
+
+// Verification remembers where it stopped locating records, even once the
+// damage is gone. Bad data is found by each Read, so fixing it takes effect.
+func TestRead_RemembersUnlocatedRecords(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -659,22 +881,99 @@ func TestRead_ReportsDamageForGood(t *testing.T) {
 	require.NoError(t, l.Close())
 
 	path := filepath.Join(dir, segmentName(1))
-	offset := int64(segmentHeaderSize + recordHeaderSize)
-	flipByte(t, path, offset)
+	header := int64(segmentHeaderSize)
+	data := segmentOf(2) + recordHeaderSize
+
+	flipByte(t, path, header)
+	flipByte(t, path, data)
 
 	l = openLog(t, dir, cfg)
+	require.Equal(t, []uint64{1, 2, 3, 4}, lostIndexes(t, l))
 
-	_, err := l.Read(1, 1)
-	require.ErrorIs(t, err, ErrCorrupt)
+	flipByte(t, path, header)
+	require.Equal(t, []uint64{1, 2, 3, 4}, lostIndexes(t, l), "unlocated records stay lost")
 
-	flipByte(t, path, offset)
+	require.NoError(t, l.Close())
+	l = openLog(t, dir, cfg)
+	require.Equal(t, []uint64{3}, lostIndexes(t, l), "a new verification locates them")
 
-	_, err = l.Read(4, 1)
-	require.ErrorIs(t, err, ErrCorrupt, "damage found once is not forgotten")
+	flipByte(t, path, data)
+	require.Empty(t, lostIndexes(t, l))
+}
 
-	recs, err := l.Read(5, 6)
-	require.NoError(t, err, "other segments stay readable")
-	requireRecords(t, recs, 5, 6)
+// Bytes past the last trusted record of a closed segment hold no record.
+func TestRead_IgnoresBytesAfterTrustedRecords(t *testing.T) {
+	t.Parallel()
+
+	for name, extra := range map[string][]byte{
+		"garbage": []byte("garbage"),
+		"zeros":   make([]byte, 100),
+		"record":  appendRecord(nil, payload(5)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			cfg := Config{SegmentSize: segmentOf(4)}
+			l := openLog(t, dir, cfg)
+			appendN(t, l, 10)
+			require.NoError(t, l.Close())
+
+			appendBytes(t, filepath.Join(dir, segmentName(1)), extra)
+
+			l = openLog(t, dir, cfg)
+			require.Empty(t, lostIndexes(t, l))
+		})
+	}
+}
+
+// lostIndexes reads from every retained index and returns those Read fails on.
+// It checks that every record returned has its index and data, that a short
+// result stops right before a lost record and that the range a failure reports
+// holds the index read from.
+func lostIndexes(t *testing.T, l *Log) []uint64 {
+	t.Helper()
+
+	var lost []uint64
+
+	for from := l.FirstIndex(); from <= l.LastIndex(); from++ {
+		recs, err := l.Read(from, math.MaxInt)
+
+		var damage *CorruptError
+		if errors.As(err, &damage) {
+			require.LessOrEqual(t, damage.First, from, err)
+			require.GreaterOrEqual(t, damage.Last, from, err)
+
+			lost = append(lost, from)
+
+			continue
+		}
+
+		require.NoError(t, err)
+		require.NotEmpty(t, recs)
+
+		for i, rec := range recs {
+			require.Equal(t, from+uint64(i), rec.Index)
+			require.Equal(t, payload(rec.Index), rec.Data)
+		}
+
+		if next := recs[len(recs)-1].Index + 1; next <= l.LastIndex() {
+			_, err := l.Read(next, 1)
+			require.ErrorIs(t, err, ErrCorrupt, "short result from %d", from)
+		}
+	}
+
+	return lost
+}
+
+// lostRange returns the indexes from first to last.
+func lostRange(first, last uint64) []uint64 {
+	var out []uint64
+	for i := first; i <= last; i++ {
+		out = append(out, i)
+	}
+
+	return out
 }
 
 // snapshot copies the files of dir, as a crash would leave them, to a new

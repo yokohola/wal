@@ -29,6 +29,13 @@ const (
 	sparseInterval = 4 << 10
 )
 
+// Failures that make records impossible to locate, besides record decode ones.
+var (
+	errShortSegment     = errors.New("file is shorter than a segment header")
+	errBadSegmentHeader = errors.New("bad segment header")
+	errMissingRecords   = errors.New("segment ends before its last record")
+)
+
 type indexEntry struct {
 	index  uint64
 	offset int64
@@ -44,54 +51,34 @@ type segment struct {
 	file        *os.File     // open while the segment is active
 
 	// Bytes up to trustedEnd hold the records below trustedNext, unread by Open.
-	// The first read verifies and indexes them.
+	// The first read verifies and indexes them. Verification locates them up to
+	// readableEnd; lost says why it could not locate the rest, if any.
 	trustedEnd  int64
 	trustedNext uint64
+	readableEnd int64
+	lost        error
 	verified    bool
-	verifyMu    sync.Mutex // serializes verification and guards corrupt
-	corrupt     error      // damage verification found
+	verifyMu    sync.Mutex // serializes verification
+}
+
+// verification is what scanTrusted finds: the index entries of the trusted
+// records it located, where they end and why it could not locate the rest.
+type verification struct {
+	entries []indexEntry
+	end     int64
+	lost    error
 }
 
 func newSegment(dir string, first uint64) *segment {
 	return &segment{
-		first:    first,
-		path:     filepath.Join(dir, segmentName(first)),
-		size:     segmentHeaderSize,
-		verified: true,
+		first:       first,
+		path:        filepath.Join(dir, segmentName(first)),
+		size:        segmentHeaderSize,
+		trustedEnd:  segmentHeaderSize,
+		trustedNext: first,
+		readableEnd: segmentHeaderSize,
+		verified:    true,
 	}
-}
-
-// trust accepts the bytes up to end as the records below next, unread.
-func (s *segment) trust(end int64, next uint64) {
-	s.size, s.count = end, next-s.first
-	s.trustedEnd, s.trustedNext = end, next
-	s.verified = false
-}
-
-// scanTrusted reads the trusted bytes, checking the header, every record and
-// that they hold exactly the trusted records, and returns their index entries.
-func (s *segment) scanTrusted() ([]indexEntry, error) {
-	file, err := os.Open(s.path)
-	if err != nil {
-		return nil, wrap(err)
-	}
-	defer func() { _ = file.Close() }() // read only, nothing to lose
-
-	if err := s.checkHeader(file); err != nil {
-		return nil, err
-	}
-
-	prefix := newSegment(filepath.Dir(s.path), s.first)
-	if err := prefix.scan(file, s.trustedEnd); err != nil {
-		return nil, s.recordError(prefix.size, err)
-	}
-
-	if prefix.nextIndex() != s.trustedNext {
-		return nil, fmt.Errorf("%w: %s ends at index %d but should end at %d",
-			ErrCorrupt, s.path, prefix.nextIndex()-1, s.trustedNext-1)
-	}
-
-	return prefix.sparseIndex, nil
 }
 
 // createSegment makes an empty segment through a temp file and a rename, so a
@@ -122,14 +109,75 @@ func createSegment(dir string, first uint64, prealloc int64) (*segment, error) {
 	return seg, nil
 }
 
+// trust accepts the bytes up to end as the records below next, unread.
+func (s *segment) trust(end int64, next uint64) {
+	s.size, s.count = end, next-s.first
+	s.trustedEnd, s.trustedNext = end, next
+	s.verified = false
+}
+
+// scanTrusted reads the trusted bytes, checking the header and every record. A
+// record with bad data is still located by its header and passed over. A bad
+// segment or record header, a record cut short or bytes ending early leave the
+// trusted records from there on unlocated: the scan never resyncs, since a
+// record's data may itself hold valid records. Bytes past the last trusted
+// record hold no record and are ignored.
+func (s *segment) scanTrusted() (verification, error) {
+	file, err := os.Open(s.path)
+	if err != nil {
+		return verification{}, wrap(err)
+	}
+	defer func() { _ = file.Close() }() // read only, nothing to lose
+
+	prefix := newSegment(filepath.Dir(s.path), s.first)
+
+	if err := s.checkHeader(file); err != nil {
+		if !isDecodeError(err) {
+			return verification{}, err
+		}
+
+		return verification{end: prefix.size, lost: err}, nil
+	}
+
+	reader := recordReader{src: file, offset: prefix.size, end: s.trustedEnd}
+
+	for prefix.nextIndex() < s.trustedNext {
+		start := reader.offset
+
+		_, err := reader.next()
+		if errors.Is(err, errBadData) {
+			err = reader.skip()
+		}
+
+		if errors.Is(err, io.EOF) {
+			err = errMissingRecords
+		}
+
+		if isDecodeError(err) {
+			return verification{entries: prefix.sparseIndex, end: prefix.size, lost: err}, nil
+		}
+
+		if err != nil {
+			return verification{}, err
+		}
+
+		prefix.addRecord(reader.offset - start)
+	}
+
+	return verification{entries: prefix.sparseIndex, end: prefix.size}, nil
+}
+
 // nextIndex returns the index the next appended record gets.
 func (s *segment) nextIndex() uint64 {
 	return s.first + s.count
 }
 
-// addRecord accounts for a record of size bytes at the end of the segment.
+// addRecord accounts for a record of size bytes at the end of the segment. The
+// first record past the trusted bytes is always indexed, so reads of it never
+// start in the trusted records.
 func (s *segment) addRecord(size int64) {
-	if n := len(s.sparseIndex); n == 0 || s.size-s.sparseIndex[n-1].offset >= sparseInterval {
+	n := len(s.sparseIndex)
+	if n == 0 || s.size == s.trustedEnd || s.size-s.sparseIndex[n-1].offset >= sparseInterval {
 		s.sparseIndex = append(s.sparseIndex, indexEntry{index: s.nextIndex(), offset: s.size})
 	}
 
@@ -154,15 +202,30 @@ func (s *segment) position(index uint64) (uint64, int64) {
 	return s.sparseIndex[i].index, s.sparseIndex[i].offset
 }
 
+// nextIndexed returns the first indexed record after index, where a read can
+// start without scanning what precedes it, or the segment's next index.
+func (s *segment) nextIndexed(index uint64) uint64 {
+	i, _ := slices.BinarySearchFunc(s.sparseIndex, index+1,
+		func(entry indexEntry, target uint64) int {
+			return cmp.Compare(entry.index, target)
+		})
+	if i < len(s.sparseIndex) {
+		return s.sparseIndex[i].index
+	}
+
+	return s.nextIndex()
+}
+
 // read appends records with index >= from to out until out holds limit records
-// or the segment ends. The segment must be verified. Callers hold the log's
-// read lock, so nothing is published meanwhile.
+// or the segment ends. At damage it returns out with the records before it and
+// a *CorruptError. The segment must be verified. Callers hold the log's read
+// lock, so nothing is published meanwhile.
 func (s *segment) read(from uint64, limit int, out []Record) ([]Record, error) {
 	file := s.file
 	if file == nil {
 		closed, err := os.Open(s.path)
 		if err != nil {
-			return nil, wrap(err)
+			return out, wrap(err)
 		}
 		defer func() { _ = closed.Close() }() // read only, nothing to lose
 
@@ -170,24 +233,60 @@ func (s *segment) read(from uint64, limit int, out []Record) ([]Record, error) {
 	}
 
 	index, offset := s.position(from)
-	reader := recordReader{src: file, offset: offset, end: s.size}
 
-	for ; len(out) < limit; index++ {
-		data, err := reader.next()
-		if errors.Is(err, io.EOF) {
-			break
+	// The trusted records and the ones after them are read as separate stretches,
+	// so a read never runs from unlocated trusted records into later ones.
+	for len(out) < limit && index < s.nextIndex() {
+		end, next := s.size, s.nextIndex()
+		if index < s.trustedNext {
+			end, next = s.readableEnd, s.trustedNext
 		}
 
-		if err != nil {
-			return nil, s.recordError(reader.offset, err)
+		reader := recordReader{src: file, offset: offset, end: end}
+
+		for ; len(out) < limit && index < next; index++ {
+			at := reader.offset
+
+			data, err := reader.next()
+			if errors.Is(err, errBadData) && index < from {
+				err = reader.skip()
+			}
+
+			if err != nil {
+				return out, s.damage(index, at, err)
+			}
+
+			if index >= from {
+				out = append(out, Record{Index: index, Data: data})
+			}
 		}
 
-		if index >= from {
-			out = append(out, Record{Index: index, Data: data})
-		}
+		offset = s.trustedEnd
 	}
 
 	return out, nil
+}
+
+// damage turns a failure to read record index at offset into a *CorruptError
+// and passes I/O errors through. Bad data loses only that record, because its
+// header still points to the next one. Any other damage loses every record up
+// to the next sparse index entry, since nothing tells where they start.
+func (s *segment) damage(index uint64, offset int64, err error) error {
+	last := index
+
+	switch {
+	case errors.Is(err, errBadData):
+	case errors.Is(err, io.EOF):
+		// Only a trusted stretch that verification could not locate ends early.
+		err = cmp.Or(s.lost, errMissingRecords)
+		last = s.nextIndexed(index) - 1
+	case isDecodeError(err):
+		last = s.nextIndexed(index) - 1
+	default:
+		return err
+	}
+
+	return &CorruptError{Path: s.path, Offset: offset, First: index, Last: last, Err: err}
 }
 
 // scan rebuilds count, size and the sparse index from file up to end. It stops
@@ -210,19 +309,20 @@ func (s *segment) scan(file *os.File, end int64) error {
 	}
 }
 
+// checkHeader fails with errShortSegment or errBadSegmentHeader on damage.
 func (s *segment) checkHeader(file *os.File) error {
 	var header [segmentHeaderSize]byte
 
 	if _, err := file.ReadAt(header[:], 0); err != nil {
 		if errors.Is(err, io.EOF) {
-			return fmt.Errorf("%w: %s is shorter than a segment header", ErrCorrupt, s.path)
+			return errShortSegment
 		}
 
 		return wrap(err)
 	}
 
 	if header != segmentHeader(s.first) {
-		return fmt.Errorf("%w: %s has a bad header", ErrCorrupt, s.path)
+		return errBadSegmentHeader
 	}
 
 	return nil
@@ -259,7 +359,7 @@ func (s *segment) close() error {
 // recordError turns a decode failure at offset into ErrCorrupt and passes other
 // errors through.
 func (s *segment) recordError(offset int64, err error) error {
-	if isRecordError(err) {
+	if isDecodeError(err) {
 		return fmt.Errorf("%w: %s at offset %d: %w", ErrCorrupt, s.path, offset, err)
 	}
 

@@ -136,6 +136,35 @@ func TestRecordReader_StopsAtFailingRecord(t *testing.T) {
 	require.Equal(t, failAt, reader.offset)
 }
 
+func TestRecordReader_SkipsRecordWithBadData(t *testing.T) {
+	t.Parallel()
+
+	buf := appendRecord(nil, []byte("bad"))
+	buf[len(buf)-1] ^= 0xff
+	buf = appendRecord(buf, []byte("next"))
+
+	reader := recordReader{src: bytes.NewReader(buf), end: int64(len(buf))}
+
+	_, err := reader.next()
+	require.ErrorIs(t, err, errBadData)
+	require.NoError(t, reader.skip())
+
+	data, err := reader.next()
+	require.NoError(t, err)
+	require.Equal(t, []byte("next"), data)
+}
+
+func TestRecordReader_SkipNeedsIntactHeader(t *testing.T) {
+	t.Parallel()
+
+	buf := appendRecord(nil, []byte("bad"))
+	buf[0] ^= 0xff
+
+	reader := recordReader{src: bytes.NewReader(buf), end: int64(len(buf))}
+	require.ErrorIs(t, reader.skip(), errBadHeader)
+	require.Zero(t, reader.offset)
+}
+
 func TestRecordReader_FileShorterThanEnd(t *testing.T) {
 	t.Parallel()
 

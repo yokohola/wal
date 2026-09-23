@@ -18,8 +18,9 @@ const (
 	checkpointSize = 36
 )
 
-// checkpoint is the durable state Open starts from: segment's bytes up to end
-// hold the records below next, durable before the checkpoint was written.
+// checkpoint is the durable state Open starts from. The bytes of segment up to
+// end hold the records below next and were synced before the checkpoint was
+// written.
 type checkpoint struct {
 	committed uint64
 	segment   uint64

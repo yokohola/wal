@@ -1,97 +1,119 @@
 # wal
 
-Append-only log of byte records on local disk. Records get dense, monotonic
-indexes starting at 1. A consumer reads from any retained index, keeps its own
-position and commits what it is done with; segments holding only committed
-records are deleted.
+[![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)](go.mod)
+[![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)](go.mod)
 
-Standard library only. Built for Linux; macOS works for development.
+Fast, crash-consistent, append-only write-ahead log for Go.
 
-## Usage
+> [!NOTE]
+> `wal` targets Linux for production and supports macOS for development.
+> Windows is not supported.
+
+> [!TIP]
+> Keep records small (1 MiB max by default). Store large payloads in separate
+> files and append a reference to them.
+
+## Features
+
+- **Crash-safe.** Committed records always survive a crash. `Open` repairs a
+  half-written tail by itself and never returns damaged data.
+- **Fast restart.** `Open` reads only what was written since the last
+  `Commit`, so startup time doesn't grow with the size of the log.
+- **Group commit.** Concurrent `Append` calls are grouped into a single write
+  and fsync, so many writers pay for one fsync instead of one each.
+- **Reads never block.** Readers never wait on writes or fsyncs, and any
+  number of them can read the log at the same time.
+- **Automatic cleanup.** Segments are deleted once all their records are
+  committed. With `MaxWALSize`, producers get `ErrFull` instead of filling the disk.
+- **Linux-tuned.** Uses `fdatasync` and preallocated segments, so most appends
+  need no metadata flush.
+- **No dependencies.** Standard library only. `flock` stops two processes
+  from opening the same directory.
+
+## Quick start
 
 ```go
-l, err := wal.Open("/data/shard-1/wal", wal.Config{})
+l, err := wal.Open("/var/lib/myapp/wal", wal.Config{SyncOnAppend: true})
 if err != nil {
 	return err
 }
 defer l.Close()
 
-last, err := l.Append(payloadA, payloadB) // indexes last-1 and last
+last, err := l.Append([]byte("set a"), []byte("set b")) // indexes last-1 and last
+if err != nil {
+	return err
+}
 
 recs, err := l.Read(l.Committed()+1, 1024) // resume where the last run stopped
+if err != nil {
+	return err
+}
 // ... process recs ...
-err = l.Commit(recs[len(recs)-1].Index) // last processed index
+
+return l.Commit(last)
 ```
 
-## Semantics
+### Consumer loop
 
-- `Append` writes a batch as consecutive records, visible to `Read` once it
-  returns. A crash can keep any prefix of the batch. `ErrFull` means the batch
-  does not fit `MaxWALSize` until more is committed; `ErrTooLarge` means it
-  never will, or a record exceeds `MaxRecordSize` (1 MiB by default). Keep large
-  payloads outside the log and append a reference to them.
-- A batch is never split across segments, so one batch can make its segment
-  exceed `SegmentSize`. `RejectBatchOnSegmentSize` rejects such a batch with
-  `ErrTooLarge` instead.
-- `Read(from, limit)` is stateless. `from` must lie in
-  `[FirstIndex, LastIndex+1]`; at `LastIndex+1` the result is empty.
-- `Commit(index)` marks records up to and including `index` as processed. It
-  makes them and the checkpoint durable, then deletes closed segments holding
-  only committed records. `Committed` returns the last committed index, 0 when
-  none. When the active segment is fully committed and space is needed,
-  `Append` rolls it away. `FirstIndex-1 <= Committed <= LastIndex` always holds.
-- Durability: `SyncOnAppend` fsyncs every append, `SyncInterval` in the
-  background, `Sync` on demand. Segment roll, `Commit` and `Close` always sync.
-  Appends that arrive while another is writing are written as one group and
-  share its write and fsync; a single writer amortizes by batching records into
-  one `Append`.
-- After a failed write or fsync the log refuses `Append`, `Commit` and `Sync`
-  with that error. Reads keep working. Reopen to recover; the failed batch may
-  then be present.
-- `Size` and `MaxWALSize` count retained bytes. On Linux the active segment is
-  preallocated, so it can take up to `SegmentSize` on disk while it fills.
-- One process per directory, enforced with `flock`.
+```go
+func consume(ctx context.Context, l *wal.Log) error {
+	for next := l.Committed() + 1; ctx.Err() == nil; {
+		recs, err := l.Read(next, 1024)
+		if err != nil {
+			return err
+		}
 
-## Recovery
+		if len(recs) == 0 {
+			time.Sleep(10 * time.Millisecond) // caught up
+			continue
+		}
 
-`Open` reads only the active segment past the end the last `Commit` or `Close`
-made durable: nothing after a clean `Close`, the records appended since the
-last `Commit` after a crash, the whole active segment when the log rolled since.
-Closed segments were sealed before the next one was created, so they are
-trusted unread; their record counts come from the file names. The first `Read`
-of a segment verifies its trusted part without blocking other calls, so damage
-there surfaces as `ErrCorrupt` from every `Read` of that segment instead of
-from `Open`.
+		for _, rec := range recs {
+			apply(rec.Index, rec.Data)
+		}
 
-`Open` repairs what a crash can leave and reports anything else as `ErrCorrupt`:
+		last := recs[len(recs)-1].Index
+		next = last + 1
 
-- A torn tail of the active segment is truncated and the file synced. A record
-  counts as torn when it runs past the end of the file or has a 512-byte sector
-  that reads as zeros, which is how an unwritten sector looks after a crash.
-  Any other bad record is corruption.
-- Temp files of an interrupted segment or checkpoint write are deleted.
-- Segments holding only committed records, left by a crash during
-  reclamation, are deleted, gaps among them included.
-- A checkpoint short of the first segment, past the last record, naming a
-  missing segment or not matching the active segment, a renamed active
-  segment, and, on first `Read`, a gap between segments, a renamed closed
-  segment and bytes after a closed segment are corruption.
+		if err := l.Commit(last); err != nil {
+			return err
+		}
+	}
 
-This assumes a crash leaves unwritten file ranges reading as zeros, as ext4
-with `data=ordered`, xfs and apfs do. A bad record whose data is legitimately
-zero across a whole sector is indistinguishable from a torn one.
-
-## Layout
-
-```
-LOCK                       flock target
-checkpoint                 committed index, durable end of the active segment
-                           and CRC32C, replaced atomically
-00000000000000000001.wal   segment named by its first index
-00000000000000524289.wal
+	return ctx.Err()
+}
 ```
 
-A segment is a 16-byte header (`WALS`, version, first index) followed by
-records. A record is a 12-byte header (data length, CRC32C of the data, CRC32C
-of those 8 bytes) and the data. The header checksum lets recovery trust a
-length before reading past it.
+## Configuration
+
+| Field | Default | Meaning |
+|---|---|---|
+| `SegmentSize` | 64 MiB | Roll to a new segment at this size. |
+| `MaxWALSize` | no cap | Total size cap; `Append` returns `ErrFull` until more is committed. |
+| `MaxRecordSize` | 1 MiB | Larger records are rejected with `ErrTooLarge`. |
+| `RejectBatchOnSegmentSize` | `false` | Reject batches that would push a segment past `SegmentSize`. |
+| `SyncOnAppend` | `false` | fsync before every `Append` returns; concurrent appends share one. |
+| `SyncInterval` | off | fsync in the background at this period. |
+
+Segment roll, `Commit`, `Close` and `Sync` always fsync.
+
+## Errors
+
+| Error | When |
+|---|---|
+| `ErrFull` | The log is at `MaxWALSize`; commit, then retry. |
+| `ErrTooLarge` | The record or batch can never fit. |
+| `ErrCorrupt` | Damage a crash cannot cause. `Read` returns the records before it, then a `*CorruptError` naming the lost range; read from `Last+1` to skip it. |
+| `ErrOutOfRange` | Index outside `[FirstIndex, LastIndex+1]`. |
+| `ErrLocked` | Another process holds the directory. |
+| `ErrClosed` | The log is closed. |
+
+After a failed write or fsync, `Append`, `Commit` and `Sync` keep returning
+that error; reopen the log to recover.
+
+## Testing
+
+```sh
+go test -race ./...
+go test -run '^$' -bench . -benchmem ./...
+```

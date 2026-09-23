@@ -38,23 +38,10 @@ type recordReader struct {
 }
 
 // next returns the data of the next record or io.EOF at end. On a decode error
-// offset stays at the failing record.
+// offset stays at the failing record; after errBadData, skip passes over it.
 func (r *recordReader) next() ([]byte, error) {
-	if r.offset >= r.end {
-		return nil, io.EOF
-	}
-
-	if err := r.fill(recordHeaderSize); err != nil {
-		return nil, err
-	}
-
-	length, err := decodeHeader(r.chunk)
+	size, err := r.locate()
 	if err != nil {
-		return nil, err
-	}
-
-	size := recordHeaderSize + length
-	if err := r.fill(size); err != nil {
 		return nil, err
 	}
 
@@ -63,10 +50,50 @@ func (r *recordReader) next() ([]byte, error) {
 		return nil, err
 	}
 
-	r.chunk = r.chunk[size:]
-	r.offset += size
+	r.advance(size)
 
 	return data, nil
+}
+
+// skip passes over the next record without checking its data. Its header gives
+// its size, so this works on a record whose data alone is damaged.
+func (r *recordReader) skip() error {
+	size, err := r.locate()
+	if err != nil {
+		return err
+	}
+
+	r.advance(size)
+
+	return nil
+}
+
+// locate buffers the next record whole and returns its size.
+func (r *recordReader) locate() (int64, error) {
+	if r.offset >= r.end {
+		return 0, io.EOF
+	}
+
+	if err := r.fill(recordHeaderSize); err != nil {
+		return 0, err
+	}
+
+	length, err := decodeHeader(r.chunk)
+	if err != nil {
+		return 0, err
+	}
+
+	size := recordHeaderSize + length
+	if err := r.fill(size); err != nil {
+		return 0, err
+	}
+
+	return size, nil
+}
+
+func (r *recordReader) advance(size int64) {
+	r.chunk = r.chunk[size:]
+	r.offset += size
 }
 
 // fill makes at least n bytes available in chunk, fetching from offset when
@@ -142,7 +169,16 @@ func decodeRecord(buf []byte) ([]byte, error) {
 	return data, nil
 }
 
-// isRecordError reports whether err is a decode failure rather than an I/O one.
-func isRecordError(err error) bool {
-	return errors.Is(err, errShortRecord) || errors.Is(err, errBadHeader) || errors.Is(err, errBadData)
+// isDecodeError reports whether err is a failure to decode a record or segment
+// header rather than an I/O one.
+func isDecodeError(err error) bool {
+	for _, target := range []error{
+		errShortRecord, errBadHeader, errBadData, errShortSegment, errBadSegmentHeader, errMissingRecords,
+	} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+
+	return false
 }

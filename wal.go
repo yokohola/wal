@@ -44,6 +44,17 @@ var (
 // syncData makes a file's written data durable.
 var syncData = fdatasync
 
+// CorruptError is the ErrCorrupt Read returns when the segment file Path is
+// damaged at byte Offset and records First to Last cannot be read. A consumer
+// that gives them up reads on from Last+1; the log itself never skips them.
+type CorruptError struct {
+	Path   string
+	Offset int64
+	First  uint64
+	Last   uint64
+	Err    error // what is wrong at Offset
+}
+
 // Config configures a Log. The zero value gives 64 MiB segments, 1 MiB records,
 // no size cap and fsync only where durability requires it: segment roll, Commit
 // and Close.
@@ -189,6 +200,19 @@ func (c Config) withDefaults() (Config, error) {
 	return c, nil
 }
 
+func (e *CorruptError) Error() string {
+	return fmt.Sprintf("%v: %s at offset %d, records %d to %d: %v",
+		ErrCorrupt, e.Path, e.Offset, e.First, e.Last, e.Err)
+}
+
+func (e *CorruptError) Is(target error) bool {
+	return target == ErrCorrupt
+}
+
+func (e *CorruptError) Unwrap() error {
+	return e.Err
+}
+
 // Append writes data as consecutive records and returns the last one's index.
 // A crash can keep any prefix of the batch, even of one whose Append failed.
 func (l *Log) Append(data ...[]byte) (uint64, error) {
@@ -237,6 +261,9 @@ func (l *Log) Append(data ...[]byte) (uint64, error) {
 // Read returns up to limit records from index from, which must lie in
 // [FirstIndex, LastIndex+1]; at LastIndex+1 it returns none. The caller owns the
 // data, and no slice's capacity reaches into another record.
+//
+// Damage on disk ends the result early at the last intact record. A Read that
+// starts at damage fails with a *CorruptError naming the records lost.
 func (l *Log) Read(from uint64, limit int) ([]Record, error) {
 	for {
 		recs, unverified, err := l.read(from, limit)
@@ -280,6 +307,10 @@ func (l *Log) read(from uint64, limit int) ([]Record, *segment, error) {
 		var err error
 
 		out, err = seg.read(from, limit, out)
+		if errors.Is(err, ErrCorrupt) && len(out) > 0 {
+			return out, nil, nil
+		}
+
 		if err != nil {
 			return nil, nil, err
 		}
@@ -289,14 +320,10 @@ func (l *Log) read(from uint64, limit int) ([]Record, *segment, error) {
 }
 
 // verify checks the trusted part of seg without holding mu, then publishes its
-// index. Damage found is remembered and reported by every later call.
+// index and where its located records end. Reads report the rest as lost.
 func (l *Log) verify(seg *segment) error {
 	seg.verifyMu.Lock()
 	defer seg.verifyMu.Unlock()
-
-	if seg.corrupt != nil {
-		return seg.corrupt
-	}
 
 	l.mu.RLock()
 	verified, reclaimed := seg.verified, seg.first < l.segments[0].first
@@ -306,7 +333,7 @@ func (l *Log) verify(seg *segment) error {
 		return nil
 	}
 
-	entries, err := seg.scanTrusted()
+	found, err := seg.scanTrusted()
 	if errors.Is(err, fs.ErrNotExist) {
 		l.mu.RLock()
 		reclaimed = seg.first < l.segments[0].first
@@ -317,16 +344,13 @@ func (l *Log) verify(seg *segment) error {
 		}
 	}
 
-	if errors.Is(err, ErrCorrupt) {
-		seg.corrupt = err
-	}
-
 	if err != nil {
 		return err
 	}
 
 	l.mu.Lock()
-	seg.sparseIndex = append(entries, seg.sparseIndex...)
+	seg.sparseIndex = append(found.entries, seg.sparseIndex...)
+	seg.readableEnd, seg.lost = found.end, found.lost
 	seg.verified = true
 	l.mu.Unlock()
 
@@ -604,8 +628,9 @@ func (l *Log) makeRoom(batch int64) error {
 	return l.reclaim()
 }
 
-// writeGroup writes the queued batches in order, with the outcome of appending
-// them one by one, sharing a write and fsync while they fit the active segment.
+// writeGroup writes the queued batches in order. Each batch gets the result it
+// would get if appended alone, and batches that fit the active segment together
+// share one write and fsync.
 func (l *Log) writeGroup(group []*appendRequest) {
 	var (
 		pending []*appendRequest
@@ -646,8 +671,9 @@ func (l *Log) writeGroup(group []*appendRequest) {
 	}
 }
 
-// fitsBehind reports whether a batch fits the active segment and MaxWALSize
-// after pending unpublished bytes, the only case where makeRoom would not roll.
+// fitsBehind reports whether a batch fits in the active segment and MaxWALSize
+// right after the pending bytes. Only then can it join the pending write, since
+// makeRoom would not roll for it.
 func (l *Log) fitsBehind(pending, size int64) bool {
 	if l.active().size+pending+size > l.cfg.SegmentSize {
 		return false
