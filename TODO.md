@@ -11,6 +11,8 @@
   deletions are retried.
 - Inclusive Commit: `Commit(index)` includes index; `Committed()` is the last
   committed index, 0 when none.
+- Oversized segments: opt-in `RejectBatchOnSegmentSize` rejects a batch that
+  does not fit an empty segment. Without it a batch still overshoots.
 
 ## Open
 
@@ -29,15 +31,6 @@ Problem: `Read` returns `[]byte`, so one large record is allocated whole.
 
 Note: MaxRecordSize bounds one record, not a Read. `Read(from, limit)` can
 still hold `limit` × MaxRecordSize.
-
-### Oversized segments
-
-Problem: a batch is never split, so one large batch makes its segment far
-larger than SegmentSize, and `reclaim` frees it only when fully committed.
-
-Note: MaxRecordSize does not bound the overshoot; only MaxWALSize bounds a
-batch. Splitting a batch at a roll would publish part of a batch before Append
-succeeds, unless new segments are staged unpublished.
 
 ## Decisions
 

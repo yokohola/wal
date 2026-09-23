@@ -46,6 +46,9 @@ func TestOpen_RejectsInvalidConfig(t *testing.T) {
 		"negative sync interval":          {SyncInterval: -time.Second},
 		"max wal size below segment size": {SegmentSize: 1024, MaxWALSize: 1023},
 		"max wal size below default":      {MaxWALSize: DefaultSegmentSize - 1},
+		"record does not fit segment": {
+			SegmentSize: 1024, MaxRecordSize: 1024 - segmentHeaderSize - recordHeaderSize + 1, RejectBatchOnSegmentSize: true,
+		},
 	}
 
 	for name, cfg := range cases {
@@ -190,6 +193,41 @@ func TestAppend_RejectsBatchThatNeverFits(t *testing.T) {
 	require.Equal(t, []string{segmentName(1)}, segmentFiles(t, dir), "a rejected batch does not roll")
 
 	appendN(t, l, 1)
+	requireRecords(t, readAll(t, l), 1, 5)
+}
+
+func TestAppend_RejectBatchOnSegmentSize(t *testing.T) {
+	t.Parallel()
+
+	exact := Config{SegmentSize: 1024, MaxRecordSize: 1024 - segmentHeaderSize - recordHeaderSize, RejectBatchOnSegmentSize: true}
+	openLog(t, t.TempDir(), exact)
+
+	dir := t.TempDir()
+	cfg := Config{SegmentSize: segmentOf(4), MaxRecordSize: payloadSize, RejectBatchOnSegmentSize: true}
+	l := openLog(t, dir, cfg)
+	appendN(t, l, 1)
+
+	five := make([][]byte, 5)
+	for i := range five {
+		five[i] = payload(uint64(i + 2))
+	}
+
+	_, err := l.Append(five...)
+	require.ErrorIs(t, err, ErrTooLarge)
+	require.Equal(t, uint64(1), l.LastIndex(), "nothing of a rejected batch is written")
+	require.Equal(t, []string{segmentName(1)}, segmentFiles(t, dir), "a rejected batch does not roll")
+
+	last, err := l.Append(five[:4]...)
+	require.NoError(t, err, "a batch filling an empty segment exactly fits")
+	require.Equal(t, uint64(5), last)
+	require.Equal(t, []string{segmentName(1), segmentName(2)}, segmentFiles(t, dir))
+	require.NoError(t, l.Close())
+
+	info, err := os.Stat(filepath.Join(dir, segmentName(2)))
+	require.NoError(t, err)
+	require.Equal(t, segmentOf(4), info.Size())
+
+	l = openLog(t, dir, cfg)
 	requireRecords(t, readAll(t, l), 1, 5)
 }
 

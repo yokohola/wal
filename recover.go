@@ -16,55 +16,6 @@ const sectorSize = 512
 
 var zeroSector [sectorSize]byte
 
-// load rebuilds the log from its directory, reading only what follows the
-// checkpoint. It removes what a crash left behind; anything else is ErrCorrupt.
-func (l *Log) load() error {
-	firsts, err := listSegments(l.dir)
-	if err != nil {
-		return err
-	}
-
-	cp, found, err := readCheckpoint(l.dir)
-	if err != nil {
-		return err
-	}
-
-	var segments []*segment
-
-	switch {
-	case len(firsts) == 0 && found:
-		return fmt.Errorf("%w: checkpoint %d but no segments", ErrCorrupt, cp.committed)
-	case len(firsts) == 0:
-		seg, err := createSegment(l.dir, 1, l.cfg.SegmentSize)
-		if err != nil {
-			return err
-		}
-
-		segments = []*segment{seg}
-	default:
-		if !found && firsts[0] != 1 {
-			return fmt.Errorf("%w: no checkpoint but the first segment starts at %d", ErrCorrupt, firsts[0])
-		}
-
-		segments, err = loadSegments(l.dir, firsts, cp, l.cfg.SegmentSize)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Recovery synced the active segment, so every record found is durable.
-	l.segments = segments
-	l.committed = cp.committed
-	l.saved = cp
-	l.markSynced()
-
-	for _, seg := range segments {
-		l.size += seg.size
-	}
-
-	return nil
-}
-
 // listSegments returns the first indexes of the segments in dir, ascending. It
 // deletes the temp files a crash leaves while a segment or the checkpoint is
 // written and leaves every other file alone.

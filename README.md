@@ -30,6 +30,9 @@ err = l.Commit(recs[len(recs)-1].Index) // last processed index
   does not fit `MaxWALSize` until more is committed; `ErrTooLarge` means it
   never will, or a record exceeds `MaxRecordSize` (1 MiB by default). Keep large
   payloads outside the log and append a reference to them.
+- A batch is never split across segments, so one batch can make its segment
+  exceed `SegmentSize`. `RejectBatchOnSegmentSize` rejects such a batch with
+  `ErrTooLarge` instead.
 - `Read(from, limit)` is stateless. `from` must lie in
   `[FirstIndex, LastIndex+1]`; at `LastIndex+1` the result is empty.
 - `Commit(index)` marks records up to and including `index` as processed. It

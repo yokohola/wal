@@ -47,8 +47,13 @@ var (
 type Config struct {
 	// SegmentSize is the size at which the active segment is closed and a new
 	// one started. A batch is never split, so a segment may exceed it by one
-	// batch.
+	// batch unless RejectBatchOnSegmentSize is set.
 	SegmentSize int64
+
+	// RejectBatchOnSegmentSize makes Append fail with ErrTooLarge on a batch
+	// that does not fit an empty segment, so no segment exceeds SegmentSize.
+	// A record of MaxRecordSize must then fit one.
+	RejectBatchOnSegmentSize bool
 
 	// MaxWALSize caps Size, the bytes of all segments. Append fails with ErrFull
 	// while a batch does not fit and with ErrTooLarge when it never can. Zero
@@ -170,6 +175,12 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MaxRecordSize > formatMaxRecordLen {
 		return c, fmt.Errorf("%w: MaxRecordSize %d exceeds the format limit %d",
 			ErrInvalidConfig, c.MaxRecordSize, int64(formatMaxRecordLen))
+	}
+
+	largest := segmentHeaderSize + recordHeaderSize + c.MaxRecordSize
+	if c.RejectBatchOnSegmentSize && largest > c.SegmentSize {
+		return c, fmt.Errorf("%w: a record of MaxRecordSize %d does not fit SegmentSize %d",
+			ErrInvalidConfig, c.MaxRecordSize, c.SegmentSize)
 	}
 
 	if c.MaxWALSize > 0 && c.MaxWALSize < c.SegmentSize {
@@ -448,6 +459,55 @@ func (l *Log) Close() error {
 	return errors.Join(l.saveCheckpoint(cp), l.release())
 }
 
+// load rebuilds the log from its directory, reading only what follows the
+// checkpoint. It removes what a crash left behind; anything else is ErrCorrupt.
+func (l *Log) load() error {
+	firsts, err := listSegments(l.dir)
+	if err != nil {
+		return err
+	}
+
+	cp, found, err := readCheckpoint(l.dir)
+	if err != nil {
+		return err
+	}
+
+	var segments []*segment
+
+	switch {
+	case len(firsts) == 0 && found:
+		return fmt.Errorf("%w: checkpoint %d but no segments", ErrCorrupt, cp.committed)
+	case len(firsts) == 0:
+		seg, err := createSegment(l.dir, 1, l.cfg.SegmentSize)
+		if err != nil {
+			return err
+		}
+
+		segments = []*segment{seg}
+	default:
+		if !found && firsts[0] != 1 {
+			return fmt.Errorf("%w: no checkpoint but the first segment starts at %d", ErrCorrupt, firsts[0])
+		}
+
+		segments, err = loadSegments(l.dir, firsts, cp, l.cfg.SegmentSize)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Recovery synced the active segment, so every record found is durable.
+	l.segments = segments
+	l.committed = cp.committed
+	l.saved = cp
+	l.markSynced()
+
+	for _, seg := range segments {
+		l.size += seg.size
+	}
+
+	return nil
+}
+
 func (l *Log) active() *segment {
 	if len(l.segments) == 0 {
 		return nil
@@ -487,7 +547,8 @@ func (l *Log) fail(err error) error {
 }
 
 // batchSize returns the encoded size of data. It fails with ErrTooLarge when a
-// record exceeds MaxRecordSize or the batch can never fit MaxWALSize.
+// record exceeds MaxRecordSize or the batch can never fit MaxWALSize, or an
+// empty segment when RejectBatchOnSegmentSize is set.
 func (l *Log) batchSize(data [][]byte) (int64, error) {
 	var total int64
 
@@ -498,6 +559,10 @@ func (l *Log) batchSize(data [][]byte) (int64, error) {
 		}
 
 		total += recordHeaderSize + int64(len(rec))
+	}
+
+	if l.cfg.RejectBatchOnSegmentSize && segmentHeaderSize+total > l.cfg.SegmentSize {
+		return 0, fmt.Errorf("%w: %d bytes do not fit SegmentSize %d", ErrTooLarge, total, l.cfg.SegmentSize)
 	}
 
 	if l.cfg.MaxWALSize > 0 && segmentHeaderSize+total > l.cfg.MaxWALSize {
