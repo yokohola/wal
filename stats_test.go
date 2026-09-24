@@ -101,10 +101,10 @@ func TestStats_ConcurrentWithWrites(t *testing.T) {
 
 	l := openLog(t, t.TempDir(), Config{SegmentSize: segmentOf(16), MaxRecordSize: payloadSize, SyncOnAppend: true})
 
-	var wg sync.WaitGroup
+	var appenders, committer sync.WaitGroup
 
 	for range writers {
-		wg.Go(func() {
+		appenders.Go(func() {
 			for i := range perWriter {
 				if _, err := l.Append(payload(uint64(i))); err != nil {
 					t.Error(err)
@@ -115,8 +115,17 @@ func TestStats_ConcurrentWithWrites(t *testing.T) {
 		})
 	}
 
-	wg.Go(func() {
-		for l.Stats().Appends < writers*perWriter {
+	// The committer stops once the writers do, whether they finished or failed.
+	done := make(chan struct{})
+
+	committer.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+
 			if err := l.Commit(l.LastIndex()); err != nil {
 				t.Error(err)
 
@@ -125,7 +134,9 @@ func TestStats_ConcurrentWithWrites(t *testing.T) {
 		}
 	})
 
-	wg.Wait()
+	appenders.Wait()
+	close(done)
+	committer.Wait()
 
 	s := l.Stats()
 	require.Equal(t, uint64(writers*perWriter), s.Appends)

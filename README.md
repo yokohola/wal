@@ -129,15 +129,17 @@ func reopen(l *wal.Log) (*wal.Log, error) {
 
 ### Metrics
 
-Export `Stats` to Prometheus; every scrape reads a fresh snapshot:
+Export `Stats` to Prometheus once; every scrape reads the current log, so the
+metrics follow a reopen:
 
 ```go
-// registerMetrics exports the log's Stats as Prometheus metrics.
-func registerMetrics(l *wal.Log) {
+// registerMetrics exports Stats of the log current returns as Prometheus
+// metrics.
+func registerMetrics(current func() *wal.Log) {
 	gauge := func(name, help string, value func(wal.Stats) float64) {
 		prometheus.MustRegister(prometheus.NewGaugeFunc(
 			prometheus.GaugeOpts{Name: name, Help: help},
-			func() float64 { return value(l.Stats()) }))
+			func() float64 { return value(current().Stats()) }))
 	}
 
 	gauge("wal_lag", "Records not yet committed.",
@@ -149,7 +151,7 @@ func registerMetrics(l *wal.Log) {
 
 	prometheus.MustRegister(prometheus.NewCounterFunc(
 		prometheus.CounterOpts{Name: "wal_appends_total", Help: "Records appended."},
-		func() float64 { return float64(l.Stats().Appends) }))
+		func() float64 { return float64(current().Stats().Appends) }))
 }
 ```
 
