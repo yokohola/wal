@@ -12,6 +12,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// bigLog is a closed log whose segments span several sparse index entries:
+// segments 1 and 401 hold 400 records each and the active segment 801 holds
+// 200. Entries fall every 171 records, at indexes 1, 172 and 343 of the first.
+const (
+	bigLogRecords  = 1000
+	bigLogInterval = 171
+)
+
+var bigLogConfig = Config{SegmentSize: segmentOf(400), MaxRecordSize: payloadSize}
+
+// indexModes are the two ways a reopened log verifies a trusted segment: from
+// its index file, or by a scan once the index files are deleted.
+var indexModes = map[string]bool{"indexed": true, "scanned": false}
+
 func TestReopen_RestoresState(t *testing.T) {
 	t.Parallel()
 
@@ -564,10 +578,9 @@ func testReadsWhileAppending(t *testing.T, indexed bool) {
 	}
 }
 
-// Damage in trusted records fails only the records it makes unreadable. Records
-// before it come back as a short result and records after it read normally.
-// These segments are small enough for one index entry, so a bad record header
-// loses the rest of its segment whether or not an index is loaded.
+// Damage in trusted records fails only the records it makes unreadable, and the
+// records around it read normally. Each segment has one index entry, so a bad
+// header loses the rest of its segment with or without an index.
 func TestRead_ReportsLostTrustedRecords(t *testing.T) {
 	t.Parallel()
 
@@ -715,10 +728,9 @@ func TestRead_ReportsLostTrustedRecords(t *testing.T) {
 	}
 }
 
-// Flipping any byte of a trusted segment loses exactly the records it covers:
-// one record for its data, the rest of the segment for a header. No Read ever
-// returns a record under a wrong index. Open checks the active segment's header
-// itself. The segments hold one index entry each, so an index changes nothing.
+// A flipped byte in trusted records loses its record when in data and the rest
+// of the segment when in a header, and a bad active segment header fails Open.
+// Each segment has one index entry, so an index changes nothing.
 func TestRead_EveryFlippedTrustedByteLosesItsRange(t *testing.T) {
 	t.Parallel()
 
@@ -975,16 +987,6 @@ func TestRead_IgnoresBytesAfterTrustedRecords(t *testing.T) {
 	}
 }
 
-// bigLog is a closed log whose segments span several sparse index entries:
-// segments 1 and 401 hold 400 records each and the active segment 801 holds
-// 200. Entries fall every 171 records, at indexes 1, 172 and 343 of the first.
-const (
-	bigLogRecords  = 1000
-	bigLogInterval = 171
-)
-
-var bigLogConfig = Config{SegmentSize: segmentOf(400), MaxRecordSize: payloadSize}
-
 // writeBigLog writes bigLog into a new directory with index files for mode.
 func writeBigLog(t *testing.T, indexed bool) string {
 	t.Helper()
@@ -1236,10 +1238,6 @@ func lostRange(first, last uint64) []uint64 {
 
 	return out
 }
-
-// indexModes are the two ways a reopened log verifies a trusted segment: from
-// its index file, or by a scan once the index files are deleted.
-var indexModes = map[string]bool{"indexed": true, "scanned": false}
 
 // useIndexes prepares dir, holding a closed log with records up to last, for a
 // mode: it checks that every segment with records has an index that matches

@@ -25,6 +25,35 @@ const (
 	testRecordSize = recordHeaderSize + payloadSize
 )
 
+// openTracker records the files openSegment opens.
+type openTracker struct {
+	fail  error // returned instead of opening, if set
+	mu    sync.Mutex
+	files []*os.File
+}
+
+func (o *openTracker) count() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return len(o.files)
+}
+
+func (o *openTracker) stillOpen() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	n := 0
+
+	for _, file := range o.files {
+		if isOpen(file) {
+			n++
+		}
+	}
+
+	return n
+}
+
 func TestOpen_FreshDirectory(t *testing.T) {
 	t.Parallel()
 
@@ -46,7 +75,6 @@ func TestOpen_RejectsInvalidConfig(t *testing.T) {
 		"negative max wal size":           {MaxWALSize: -1},
 		"negative max record size":        {MaxRecordSize: -1},
 		"record size above format":        {MaxRecordSize: math.MaxUint32 + 1},
-		"negative sync interval":          {SyncInterval: -time.Second},
 		"max wal size below segment size": {SegmentSize: 1024, MaxRecordSize: 100, MaxWALSize: 1023},
 		"max wal size below default":      {MaxWALSize: DefaultSegmentSize - 1},
 		"record above segment":            {SegmentSize: 1024, MaxRecordSize: 1025},
@@ -393,9 +421,8 @@ func TestRead_PointReadFetchesOneIndexGap(t *testing.T) {
 	require.Less(t, perRead, uint64(2*sparseInterval))
 }
 
-// A segment keeps one file while in the log: a sealed segment the one it was
-// written through, a closed segment the one Open opened. Reads open none.
-// Segments 1 and 5 are closed; 9 is active.
+// A segment keeps the file it was written or opened through, and reads open
+// none. Segments 1 and 5 are closed; 9 is active.
 func TestRead_OpensNoFiles(t *testing.T) {
 	opens := trackOpens(t)
 
@@ -764,7 +791,9 @@ func TestCommit_RetryFinishesReclaim(t *testing.T) {
 
 	size := l.Size()
 
-	require.Error(t, l.Commit(8))
+	err := l.Commit(8)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrPermanent)
 	require.Equal(t, uint64(8), l.Committed(), "the checkpoint is durable")
 	require.Equal(t, uint64(9), l.FirstIndex(), "reclaimed segments leave the log at once")
 	require.Equal(t, size, l.Size(), "undeleted files still count")
@@ -858,6 +887,23 @@ func TestSync_OnAppend(t *testing.T) {
 
 	require.NoError(t, l.Sync())
 	require.Equal(t, int64(3), calls.Load(), "nothing left to sync")
+}
+
+// With SyncOnAppend every Append is durable, so Sync and Commit fsync no
+// segment.
+func TestSync_OnAppendSkipsSegmentFsync(t *testing.T) {
+	var calls atomic.Int64
+
+	setSyncData(t, countingSync(&calls))
+
+	l := openLog(t, t.TempDir(), Config{SyncOnAppend: true})
+	appendN(t, l, 3)
+
+	before := calls.Load()
+
+	require.NoError(t, l.Sync())
+	require.NoError(t, l.Commit(3))
+	require.Equal(t, before, calls.Load())
 }
 
 func TestSync_ConcurrentAppendsShareOneFsync(t *testing.T) {
@@ -1009,25 +1055,6 @@ func TestSync_OnDemand(t *testing.T) {
 	require.Equal(t, int64(2), calls.Load())
 }
 
-func TestSync_InBackground(t *testing.T) {
-	var calls atomic.Int64
-
-	setSyncData(t, countingSync(&calls))
-
-	l := openLog(t, t.TempDir(), Config{SyncInterval: time.Millisecond})
-	appendN(t, l, 3)
-
-	require.Eventually(t, func() bool { return calls.Load() > 0 }, 5*time.Second, time.Millisecond)
-
-	require.NoError(t, l.Close())
-
-	select {
-	case <-l.syncDone:
-	default:
-		t.Fatal("background sync still running after Close")
-	}
-}
-
 func TestClose_RejectsFurtherUse(t *testing.T) {
 	t.Parallel()
 
@@ -1071,6 +1098,7 @@ func TestFailure_IsSticky(t *testing.T) {
 	failing.Store(true)
 
 	_, err := l.Append(payload(4))
+	require.ErrorIs(t, err, ErrPermanent)
 	require.ErrorIs(t, err, injected)
 	require.Equal(t, uint64(3), l.LastIndex(), "a failed append is not visible")
 
@@ -1098,7 +1126,7 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 		total     = writers * perWriter
 	)
 
-	l := openLog(t, t.TempDir(), Config{SegmentSize: 4096, MaxRecordSize: 64, SyncInterval: time.Millisecond})
+	l := openLog(t, t.TempDir(), Config{SegmentSize: 4096, MaxRecordSize: 64})
 
 	var wg sync.WaitGroup
 
@@ -1119,6 +1147,16 @@ func TestConcurrent_AppendReadCommit(t *testing.T) {
 			_ = l.FirstIndex()
 			_ = l.LastIndex()
 			_ = l.Size()
+		}
+	})
+
+	wg.Go(func() {
+		for range 100 {
+			if err := l.Sync(); err != nil {
+				t.Error(err)
+
+				return
+			}
 		}
 	})
 
@@ -1363,13 +1401,6 @@ func openLog(t *testing.T, dir string, cfg Config) *Log {
 	return l
 }
 
-// openTracker records the files openSegment opens.
-type openTracker struct {
-	fail  error // returned instead of opening, if set
-	mu    sync.Mutex
-	files []*os.File
-}
-
 // trackOpens replaces openSegment until the test ends. Callers must not run in
 // parallel, and must call it before opening a log so the log closes first.
 func trackOpens(t *testing.T) *openTracker {
@@ -1398,28 +1429,6 @@ func trackOpens(t *testing.T) *openTracker {
 	t.Cleanup(func() { openSegment = prev })
 
 	return tracker
-}
-
-func (o *openTracker) count() int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	return len(o.files)
-}
-
-func (o *openTracker) stillOpen() int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	n := 0
-
-	for _, file := range o.files {
-		if isOpen(file) {
-			n++
-		}
-	}
-
-	return n
 }
 
 func isOpen(file *os.File) bool {

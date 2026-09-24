@@ -33,24 +33,28 @@ A crash-safe write-ahead log for Go, built for high-load applications.
 ## Quick start
 
 ```go
-l, err := wal.Open("/var/lib/myapp/wal", wal.Config{SyncOnAppend: true})
-if err != nil {
-	return err
-}
-defer l.Close()
+func run() (err error) {
+	l, err := wal.Open("/var/lib/myapp/wal", wal.Config{SyncOnAppend: true})
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, l.Close()) }()
 
-last, err := l.Append([]byte("set a"))
-if err != nil {
-	return err
-}
+	if _, err := l.Append([]byte("set a")); err != nil {
+		return err
+	}
 
-recs, err := l.Read(l.Committed()+1, 1024) // resume where the last run stopped
-if err != nil {
-	return err
-}
-// ... process recs ...
+	recs, err := l.Read(l.Committed()+1, 1024)
+	if err != nil {
+		return err
+	}
 
-return l.Commit(last)
+	for _, rec := range recs {
+		apply(rec.Index, rec.Data)
+	}
+
+	return l.Commit(recs[len(recs)-1].Index)
+}
 ```
 
 ### Consumer loop
@@ -84,6 +88,45 @@ func consume(ctx context.Context, l *wal.Log) error {
 }
 ```
 
+### Sync loop
+
+Without `SyncOnAppend`, records are durable only after `Sync` or `Commit`:
+
+```go
+func syncLoop(ctx context.Context, l *wal.Log) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := l.Sync(); err != nil {
+				return err
+			}
+		}
+	}
+}
+```
+
+### Reopen
+
+After `ErrPermanent` the log must be closed and opened again. Records not yet
+synced may be lost, and a failed `Append` may still be found.
+
+```go
+// reopen replaces a log that failed with ErrPermanent. Stop every caller of the
+// old log first and switch them to the new one.
+func reopen(l *wal.Log) (*wal.Log, error) {
+	log.Printf("wal failed, reopening: %v", l.Err())
+
+	_ = l.Close() // returns the same error; the directory is released anyway
+
+	return wal.Open(dir, cfg)
+}
+```
+
 ## Configuration
 
 | Field | Default | Meaning |
@@ -92,7 +135,6 @@ func consume(ctx context.Context, l *wal.Log) error {
 | `MaxWALSize` | no cap | Cap on total segment size (`.idx` files excluded); `Append` returns `ErrFull` until more is committed. |
 | `MaxRecordSize` | 1 MiB | Larger records are rejected with `ErrTooLarge`. Must not exceed `SegmentSize`. |
 | `SyncOnAppend` | `false` | fsync before every `Append` returns; concurrent appends share one. |
-| `SyncInterval` | off | fsync in the background at this period. |
 
 Segment roll, `Commit`, `Close` and `Sync` always fsync.
 
@@ -107,6 +149,7 @@ Segment roll, `Commit`, `Close` and `Sync` always fsync.
 | `ErrLocked` | Another process holds the directory. |
 | `ErrInvalidConfig` | `Open` got an invalid `Config`. |
 | `ErrClosed` | The log is closed. |
+| `ErrPermanent` | A segment write or fsync failed; `Close` and `Open` again. `Err` reports it. |
 
 ## Testing
 

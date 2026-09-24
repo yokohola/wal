@@ -13,6 +13,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// fetchLog records the length of every ReadAt.
+type fetchLog struct {
+	src     io.ReaderAt
+	fetches []int
+}
+
+func (f *fetchLog) ReadAt(p []byte, off int64) (int, error) {
+	f.fetches = append(f.fetches, len(p))
+
+	return f.src.ReadAt(p, off)
+}
+
 func TestRecord_RoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -132,18 +144,6 @@ func TestRecordReader_CrossesChunks(t *testing.T) {
 
 	require.Equal(t, want, got)
 	require.Equal(t, int64(len(buf)), reader.offset)
-}
-
-// fetchLog records the length of every ReadAt.
-type fetchLog struct {
-	src     io.ReaderAt
-	fetches []int
-}
-
-func (f *fetchLog) ReadAt(p []byte, off int64) (int, error) {
-	f.fetches = append(f.fetches, len(p))
-
-	return f.src.ReadAt(p, off)
 }
 
 func TestRecordReader_FetchesUpToStop(t *testing.T) {

@@ -1,8 +1,8 @@
 // Package wal is an append-only log of byte records on local disk.
 //
-// Records get dense, monotonic indexes starting at 1. A consumer reads from any
-// retained index, keeps its own position and calls Commit once it is done with
-// a prefix of the log. Segments holding only committed records are deleted.
+// Records get dense indexes starting at 1. A consumer reads from any retained
+// index and commits the prefix it is done with, and fully committed segments
+// are deleted.
 package wal
 
 import (
@@ -12,7 +12,6 @@ import (
 	"os"
 	"slices"
 	"sync"
-	"time"
 )
 
 // Defaults applied to zero Config fields.
@@ -38,6 +37,12 @@ var (
 	ErrLocked        = errors.New("wal: directory locked by another process")
 	ErrOutOfRange    = errors.New("wal: index out of range")
 	ErrTooLarge      = errors.New("wal: too large")
+
+	// ErrPermanent wraps the first failed segment write, fsync or segment
+	// creation; Append, Sync, Commit and Close return it from then on, and Read
+	// still works. Close and Open the log again: records not synced before it
+	// may be lost on power failure, and a failed Append may still be found.
+	ErrPermanent = errors.New("wal: permanent failure, Close and Open the log again")
 )
 
 // syncData makes a file's written data durable.
@@ -71,13 +76,9 @@ type Config struct {
 	// larger one with ErrTooLarge. Lowering it keeps existing records readable.
 	MaxRecordSize int64
 
-	// SyncOnAppend makes every Append durable before it returns. Concurrent
-	// Appends share an fsync.
+	// SyncOnAppend makes every Append durable before it returns, with concurrent
+	// Appends sharing one fsync. Without it, call Sync or Commit.
 	SyncOnAppend bool
-
-	// SyncInterval makes appended records durable in the background at this
-	// period. Zero disables it.
-	SyncInterval time.Duration
 }
 
 // Record is one entry of the log.
@@ -86,12 +87,9 @@ type Record struct {
 	Data  []byte
 }
 
-// Log is an append-only log in one directory, created with Open, never copied,
-// safe for concurrent use; reads never wait on writes.
-//
-// Invariants: segments hold contiguous indexes, only the last one takes
-// appends, FirstIndex-1 <= Committed <= LastIndex, and committed records are
-// durable.
+// Log is an append-only log in one directory, created with Open and safe for
+// concurrent use; reads never wait on writes. Segments hold contiguous indexes,
+// only the last one takes appends, and committed records are always durable.
 type Log struct {
 	dir  string
 	cfg  Config
@@ -107,7 +105,6 @@ type Log struct {
 	synced    uint64     // records below this index are durable
 	syncedEnd int64      // offset of synced in the active segment
 	saved     checkpoint // last checkpoint written or loaded
-	failed    error      // first write or fsync failure
 	doomed    []*segment // reclaimed from segments, not yet deleted
 
 	// mu guards the fields below and the segments' state. They change only
@@ -117,9 +114,7 @@ type Log struct {
 	committed uint64
 	size      int64
 	closed    bool
-
-	syncStop chan struct{}
-	syncDone chan struct{}
+	failed    error // ErrPermanent wrapping the first write or fsync failure
 }
 
 // appendRequest is a record waiting in the queue. The leader of its group sets
@@ -156,14 +151,28 @@ func Open(dir string, cfg Config) (*Log, error) {
 		return nil, errors.Join(err, l.release())
 	}
 
-	l.startSyncer()
-
 	return l, nil
+}
+
+// Error describes the damage and the records it makes unreadable.
+func (e *CorruptError) Error() string {
+	return fmt.Sprintf("%v: %s at offset %d, records %d to %d: %v",
+		ErrCorrupt, e.Path, e.Offset, e.First, e.Last, e.Err)
+}
+
+// Is makes a CorruptError match ErrCorrupt.
+func (e *CorruptError) Is(target error) bool {
+	return target == ErrCorrupt
+}
+
+// Unwrap returns the decode failure behind the damage.
+func (e *CorruptError) Unwrap() error {
+	return e.Err
 }
 
 // withDefaults fills zero fields with defaults and validates the result.
 func (c Config) withDefaults() (Config, error) {
-	if c.SegmentSize < 0 || c.MaxWALSize < 0 || c.MaxRecordSize < 0 || c.SyncInterval < 0 {
+	if c.SegmentSize < 0 || c.MaxWALSize < 0 || c.MaxRecordSize < 0 {
 		return c, fmt.Errorf("%w: negative value", ErrInvalidConfig)
 	}
 
@@ -191,22 +200,6 @@ func (c Config) withDefaults() (Config, error) {
 	}
 
 	return c, nil
-}
-
-// Error describes the damage and the records it makes unreadable.
-func (e *CorruptError) Error() string {
-	return fmt.Sprintf("%v: %s at offset %d, records %d to %d: %v",
-		ErrCorrupt, e.Path, e.Offset, e.First, e.Last, e.Err)
-}
-
-// Is makes a CorruptError match ErrCorrupt.
-func (e *CorruptError) Is(target error) bool {
-	return target == ErrCorrupt
-}
-
-// Unwrap returns the decode failure behind the damage.
-func (e *CorruptError) Unwrap() error {
-	return e.Err
 }
 
 // Append writes data as one record and returns its index. After a crash the
@@ -352,6 +345,15 @@ func (l *Log) Size() int64 {
 	return l.size
 }
 
+// Err returns the ErrPermanent the log has failed with, or nil while it works.
+// It never waits on writes, so it suits health checks.
+func (l *Log) Err() error {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	return l.failed
+}
+
 // Sync makes every appended record durable.
 func (l *Log) Sync() error {
 	l.writeMu.Lock()
@@ -365,26 +367,19 @@ func (l *Log) Sync() error {
 }
 
 // Close makes appended records durable, so the next Open scans nothing, and
-// releases the directory. After a failure it releases without syncing.
+// releases the directory. After ErrPermanent it returns that error and releases
+// without syncing.
 func (l *Log) Close() error {
 	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
 
 	if l.closed {
-		l.writeMu.Unlock()
-
 		return ErrClosed
 	}
 
 	l.mu.Lock()
 	l.closed = true
 	l.mu.Unlock()
-	l.writeMu.Unlock()
-
-	// The syncer may be waiting for writeMu, so it is stopped without holding it.
-	l.stopSyncer()
-
-	l.writeMu.Lock()
-	defer l.writeMu.Unlock()
 
 	if l.failed != nil {
 		return errors.Join(l.failed, l.release())
@@ -392,7 +387,7 @@ func (l *Log) Close() error {
 
 	tail := l.active()
 	if err := tail.seal(); err != nil {
-		return errors.Join(err, l.release())
+		return errors.Join(l.fail(err), l.release())
 	}
 
 	tail.saveIndex()
@@ -478,7 +473,7 @@ func (l *Log) segmentFor(index uint64) int {
 	return i
 }
 
-// checkWritable returns why the log refuses mutations, if it does.
+// checkWritable returns the error a mutation fails with, if any.
 func (l *Log) checkWritable() error {
 	if l.closed {
 		return ErrClosed
@@ -487,11 +482,14 @@ func (l *Log) checkWritable() error {
 	return l.failed
 }
 
-// fail records the first write or fsync failure. Afterwards what reached the
-// disk is unknown, so every later mutation reports it until the log is reopened.
+// fail records the first write or fsync failure as ErrPermanent. Afterwards
+// what reached the disk is unknown, so every later mutation reports it until the
+// log is closed and opened again.
 func (l *Log) fail(err error) error {
 	if l.failed == nil {
-		l.failed = err
+		l.mu.Lock()
+		l.failed = fmt.Errorf("%w: %w", ErrPermanent, err)
+		l.mu.Unlock()
 	}
 
 	return l.failed
@@ -596,7 +594,7 @@ func (l *Log) fitsBehind(pending, size int64) bool {
 }
 
 // flush writes buf, the encoded records of pending, to the active segment,
-// publishes them and completes their requests.
+// makes them visible to reads and completes their requests.
 func (l *Log) flush(pending []*appendRequest, buf []byte) {
 	if len(pending) == 0 {
 		return
@@ -760,48 +758,6 @@ func (l *Log) saveCheckpoint(cp checkpoint) error {
 // the directory.
 func (l *Log) release() error {
 	return errors.Join(closeSegments(l.segments), l.lock.Close())
-}
-
-// startSyncer starts the background sync when SyncInterval is set.
-func (l *Log) startSyncer() {
-	if l.cfg.SyncInterval == 0 {
-		return
-	}
-
-	l.syncStop = make(chan struct{})
-	l.syncDone = make(chan struct{})
-
-	go l.runSyncer()
-}
-
-// runSyncer syncs at the configured interval until stopped or until a sync
-// fails, which leaves the failure for the next mutation to report.
-func (l *Log) runSyncer() {
-	defer close(l.syncDone)
-
-	ticker := time.NewTicker(l.cfg.SyncInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-l.syncStop:
-			return
-		case <-ticker.C:
-			if err := l.Sync(); err != nil {
-				return
-			}
-		}
-	}
-}
-
-// stopSyncer stops the background sync and waits for it to exit.
-func (l *Log) stopSyncer() {
-	if l.syncStop == nil {
-		return
-	}
-
-	close(l.syncStop)
-	<-l.syncDone
 }
 
 // wrap tags an operating system error, which already names the operation and
