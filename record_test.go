@@ -269,33 +269,6 @@ func TestRecordReader_FileShorterThanEnd(t *testing.T) {
 	require.ErrorIs(t, err, errShortRecord)
 }
 
-func TestHasZeroSector(t *testing.T) {
-	t.Parallel()
-
-	ones := func(n int) []byte { return bytes.Repeat([]byte{1}, n) }
-
-	cases := map[string]struct {
-		buf    []byte
-		offset int64
-		want   bool
-	}{
-		"no zeros":                 {buf: ones(2000), offset: 100, want: false},
-		"zeros not filling sector": {buf: append(ones(10), make([]byte, 100)...), offset: 0, want: false},
-		"whole zero sector":        {buf: append(append(ones(412), make([]byte, 512)...), ones(10)...), offset: 100, want: true},
-		"zero head up to boundary": {buf: append(make([]byte, 12), ones(600)...), offset: 500, want: true},
-		"zero tail from boundary":  {buf: append(ones(12), make([]byte, 4)...), offset: 500, want: true},
-		"all zero":                 {buf: make([]byte, 12), offset: 7, want: true},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			require.Equal(t, tc.want, hasZeroSector(tc.buf, tc.offset))
-		})
-	}
-}
-
 func TestSegmentName_RoundTrip(t *testing.T) {
 	t.Parallel()
 

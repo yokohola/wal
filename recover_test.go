@@ -86,9 +86,8 @@ func TestReopen_CutsTornTail(t *testing.T) {
 	}
 }
 
-// A crash can persist later pages of an unsynced write but not earlier ones.
-// Unwritten sectors read as zeros, which marks the record as torn even when
-// intact records follow it.
+// A crash can persist later pages of an unsynced write but not earlier ones, so
+// the log ends at the first bad record even when intact records follow it.
 func TestReopen_CutsRecordWithUnwrittenSector(t *testing.T) {
 	t.Parallel()
 
@@ -149,7 +148,9 @@ func TestReopen_EveryCutKeepsAPrefix(t *testing.T) {
 	}
 }
 
-func TestReopen_EveryFlippedByteInActiveSegmentIsCorrupt(t *testing.T) {
+// Past the checkpoint a flipped byte ends the log at its record; a flipped
+// header byte fails Open, since a crash never damages a segment header.
+func TestReopen_EveryFlippedByteInActiveSegmentEndsTheLog(t *testing.T) {
 	t.Parallel()
 
 	const n = 5
@@ -168,8 +169,19 @@ func TestReopen_EveryFlippedByteInActiveSegmentIsCorrupt(t *testing.T) {
 		flipDir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(flipDir, segmentName(1)), flipped(full, offset), 0o644))
 
-		_, err := Open(flipDir, Config{})
-		require.ErrorIs(t, err, ErrCorrupt, "flip at %d", offset)
+		l, err := Open(flipDir, Config{})
+		if offset < segmentHeaderSize {
+			require.ErrorIs(t, err, ErrCorrupt, "flip at %d", offset)
+
+			continue
+		}
+
+		require.NoError(t, err, "flip at %d", offset)
+
+		kept := (offset - segmentHeaderSize) / testRecordSize
+		require.Equal(t, uint64(kept), l.LastIndex(), "flip at %d", offset)
+		requireRecords(t, readAll(t, l), 1, kept)
+		require.NoError(t, l.Close())
 	}
 }
 
@@ -445,9 +457,8 @@ func TestReopen_RemovesOrphanIndexes(t *testing.T) {
 	requireRecords(t, readAll(t, l), 1, 10)
 }
 
-// A crash after Commit leaves records the checkpoint does not cover. Open
-// repairs only those: damage in what the checkpoint covers is left for reads
-// to report.
+// A crash after Commit leaves records the checkpoint does not cover, and Open
+// cuts only those; damage in what the checkpoint covers is left for reads.
 func TestReopen_ScansOnlyPastCheckpoint(t *testing.T) {
 	t.Parallel()
 
@@ -478,8 +489,9 @@ func TestReopen_ScansOnlyPastCheckpoint(t *testing.T) {
 
 	scannedDamage := snapshot(t, dir)
 	flipByte(t, filepath.Join(scannedDamage, active), fourth)
-	_, err = Open(scannedDamage, cfg)
-	require.ErrorIs(t, err, ErrCorrupt, "records past the checkpoint are scanned")
+	l = openLog(t, scannedDamage, cfg)
+	require.Equal(t, uint64(3), l.LastIndex(), "damage past the checkpoint ends the log")
+	requireRecords(t, readAll(t, l), 1, 3)
 }
 
 // When the log rolled after the last Commit, the new active segment is scanned
@@ -503,8 +515,8 @@ func TestReopen_ScansActiveFromStartAfterRoll(t *testing.T) {
 
 	activeDamage := snapshot(t, dir)
 	flipByte(t, filepath.Join(activeDamage, segmentName(5)), segmentHeaderSize+recordHeaderSize)
-	_, err := Open(activeDamage, cfg)
-	require.ErrorIs(t, err, ErrCorrupt)
+	l = openLog(t, activeDamage, cfg)
+	require.Equal(t, uint64(4), l.LastIndex(), "the active segment ends at its first bad record")
 
 	l = openLog(t, snapshot(t, dir), cfg)
 	requireRecords(t, readAll(t, l), 1, 6)
@@ -856,7 +868,8 @@ func TestRead_ReportsSwappedRecords(t *testing.T) {
 	}
 }
 
-func TestReopen_RejectsSwappedRecordsPastCheckpoint(t *testing.T) {
+// A record's checksum covers its index, so records out of place end the log.
+func TestReopen_SwappedRecordsPastCheckpointEndTheLog(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -867,9 +880,9 @@ func TestReopen_RejectsSwappedRecordsPastCheckpoint(t *testing.T) {
 	crashed := snapshot(t, dir)
 	swapRecords(t, filepath.Join(crashed, segmentName(1)), 2, 3)
 
-	_, err := Open(crashed, Config{})
-	require.ErrorIs(t, err, ErrCorrupt)
-	require.ErrorIs(t, err, errBadData)
+	l = openLog(t, crashed, Config{})
+	require.Equal(t, uint64(1), l.LastIndex())
+	requireRecords(t, readAll(t, l), 1, 1)
 }
 
 // Verification can find fewer or more trusted records than the checkpoint

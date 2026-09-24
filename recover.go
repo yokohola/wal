@@ -1,21 +1,17 @@
 package wal
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 )
 
-// sectorSize is the unit a disk writes atomically. A write cut short by a crash
-// leaves whole sectors unwritten, and those read back as zeros.
-const sectorSize = 512
-
-// zeroSector is compared against to spot unwritten sectors.
-var zeroSector [sectorSize]byte
+// truncateFile cuts a file to size.
+var truncateFile = (*os.File).Truncate
 
 // listSegments returns the first indexes of the segments in dir, ascending. It
 // deletes this package's temp files and orphaned index files, nothing else.
@@ -176,7 +172,7 @@ func loadClosedSegment(dir string, first, next uint64) (*segment, error) {
 }
 
 // recoverActiveSegment opens the last segment for appending, verifying what the
-// checkpoint covers and scanning past it; a torn tail is truncated and synced.
+// checkpoint covers and scanning past it; the log ends at the first bad record.
 func recoverActiveSegment(
 	dir string, first uint64, cp checkpoint, prealloc int64,
 ) (*segment, error) {
@@ -200,8 +196,8 @@ func recoverActiveSegment(
 	return seg, nil
 }
 
-// repairActiveSegment scans the active segment past the checkpoint, truncates a
-// torn tail, syncs and preallocates the file.
+// repairActiveSegment scans the active segment past the checkpoint, cuts it at
+// the first record that fails to decode, syncs and preallocates the file.
 func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc int64) error {
 	info, err := file.Stat()
 	if err != nil {
@@ -225,19 +221,19 @@ func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc in
 		seg.trust(cp.end, cp.next)
 	}
 
-	if scanErr := seg.scan(file, info.Size()); scanErr != nil {
-		torn, err := isTornRecord(file, seg.size, scanErr)
-		if err != nil {
-			return err
-		}
-
-		if !torn {
-			return seg.recordError(seg.size, scanErr)
-		}
+	// Nothing proves these records durable, so, as in PostgreSQL crash recovery,
+	// the first bad one ends the log along with everything after it. A read
+	// error fails Open instead, since the records may be intact.
+	if err := seg.scan(file, info.Size()); err != nil && !isDecodeError(err) {
+		return err
 	}
 
 	if seg.size < info.Size() {
-		if err := file.Truncate(seg.size); err != nil {
+		if err := removeStaleIndex(seg); err != nil {
+			return err
+		}
+
+		if err := truncateFile(file, seg.size); err != nil {
 			return wrap(err)
 		}
 	}
@@ -253,51 +249,20 @@ func repairActiveSegment(seg *segment, file *os.File, cp checkpoint, prealloc in
 	return nil
 }
 
-// isTornRecord reports whether a record that failed to decode was cut short by a
-// crash: it runs past the file end or has a sector that reads as zeros.
-func isTornRecord(file *os.File, offset int64, decodeErr error) (bool, error) {
-	if errors.Is(decodeErr, errShortRecord) {
-		return true, nil
+// removeStaleIndex deletes the index a Close left for the active segment before
+// Open cuts it: the cut records may later be replaced by others that match the
+// index's end and count at different offsets.
+func removeStaleIndex(seg *segment) error {
+	err := os.Remove(seg.indexPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
 	}
 
-	if !errors.Is(decodeErr, errBadHeader) && !errors.Is(decodeErr, errBadData) {
-		return false, decodeErr
+	if err != nil {
+		return wrap(err)
 	}
 
-	record := make([]byte, recordHeaderSize)
-	if _, err := file.ReadAt(record, offset); err != nil {
-		return false, wrap(err)
-	}
-
-	if errors.Is(decodeErr, errBadData) {
-		length, err := decodeHeader(record)
-		if err != nil {
-			return false, err
-		}
-
-		record = make([]byte, recordHeaderSize+length)
-		if _, err := file.ReadAt(record, offset); err != nil {
-			return false, wrap(err)
-		}
-	}
-
-	return hasZeroSector(record, offset), nil
-}
-
-// hasZeroSector reports whether the part of buf inside some disk sector is all
-// zeros. buf starts at file offset offset.
-func hasZeroSector(buf []byte, offset int64) bool {
-	for len(buf) > 0 {
-		n := min(int64(len(buf)), sectorSize-offset%sectorSize)
-		if bytes.Equal(buf[:n], zeroSector[:n]) {
-			return true
-		}
-
-		buf = buf[n:]
-		offset += n
-	}
-
-	return false
+	return syncDir(filepath.Dir(seg.path))
 }
 
 // isTempName reports whether name is a segment, index or checkpoint temp file

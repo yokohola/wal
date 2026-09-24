@@ -128,8 +128,9 @@ type appendRequest struct {
 	err   error
 }
 
-// Open opens or creates the log in dir, repairing what a crash can leave behind.
-// It fails with ErrCorrupt on other damage and with ErrLocked when dir is held.
+// Open opens or creates the log in dir. Records appended since the last Commit
+// or Close end at the first damaged one, as a crash leaves them; other damage
+// fails Open or Read with ErrCorrupt, and a held dir fails with ErrLocked.
 func Open(dir string, cfg Config) (*Log, error) {
 	cfg, err := cfg.withDefaults()
 	if err != nil {
@@ -403,7 +404,7 @@ func (l *Log) Close() error {
 }
 
 // load rebuilds the log from its directory, reading only what follows the
-// checkpoint. It removes what a crash left behind; anything else is ErrCorrupt.
+// checkpoint, and cuts those records at the first damaged one.
 func (l *Log) load() error {
 	firsts, err := listSegments(l.dir)
 	if err != nil {
