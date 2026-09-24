@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"time"
 )
 
 // Defaults applied to zero Config fields.
@@ -106,6 +107,7 @@ type Log struct {
 	syncedEnd int64      // offset of synced in the active segment
 	saved     checkpoint // last checkpoint written or loaded
 	doomed    []*segment // reclaimed from segments, not yet deleted
+	counters  counters
 
 	// mu guards the fields below and the segments' state. They change only
 	// under writeMu and mu together, so holding either one is enough to read.
@@ -306,6 +308,8 @@ func (l *Log) Commit(index uint64) error {
 		l.mu.Lock()
 		l.committed = index
 		l.mu.Unlock()
+
+		l.counters.commits.Add(1)
 	}
 
 	return l.reclaim()
@@ -622,6 +626,10 @@ func (l *Log) flush(pending []*appendRequest, buf []byte) {
 	l.size += int64(len(buf))
 	l.mu.Unlock()
 
+	l.counters.appends.Add(uint64(len(pending)))
+	l.counters.appendedBytes.Add(uint64(len(buf)))
+	l.counters.writes.Add(1)
+
 	if l.cfg.SyncOnAppend {
 		l.markSynced()
 	}
@@ -641,9 +649,7 @@ func (l *Log) writeActive(buf []byte) error {
 	}
 
 	if l.cfg.SyncOnAppend {
-		if err := syncData(tail.file); err != nil {
-			return l.fail(wrap(err))
-		}
+		return l.syncTail()
 	}
 
 	return nil
@@ -669,6 +675,8 @@ func (l *Log) roll() error {
 	l.segments = append(l.segments, next)
 	l.size += segmentHeaderSize
 	l.mu.Unlock()
+
+	l.counters.rolls.Add(1)
 
 	l.markSynced()
 
@@ -715,6 +723,8 @@ func (l *Log) reclaim() error {
 	l.size -= freed
 	l.mu.Unlock()
 
+	l.counters.reclaimed.Add(uint64(removed))
+
 	return err
 }
 
@@ -725,11 +735,25 @@ func (l *Log) syncActive() error {
 		return nil
 	}
 
-	if err := syncData(tail.file); err != nil {
-		return l.fail(wrap(err))
+	if err := l.syncTail(); err != nil {
+		return err
 	}
 
 	l.markSynced()
+
+	return nil
+}
+
+// syncTail fsyncs the active segment's data and counts it in Stats.
+func (l *Log) syncTail() error {
+	start := time.Now()
+	err := syncData(l.active().file)
+	l.counters.syncNanos.Add(int64(time.Since(start)))
+	l.counters.syncs.Add(1)
+
+	if err != nil {
+		return l.fail(wrap(err))
+	}
 
 	return nil
 }
