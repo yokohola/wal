@@ -1,5 +1,6 @@
 # wal
 
+[![CI](https://github.com/yokohola/wal/actions/workflows/ci.yml/badge.svg)](https://github.com/yokohola/wal/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/yokohola/wal.svg)](https://pkg.go.dev/github.com/yokohola/wal)
 [![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)](go.mod)
